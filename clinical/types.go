@@ -18,6 +18,8 @@ const (
 	ActionGranted     = "authorization_granted"
 	ActionRevoked     = "authorization_revoked"
 	ActionDeactivated = "patient_deactivated"
+	ActionExchanged   = "exchange_created"
+	ActionReceipted   = "receipt_registered"
 )
 
 // 合成数据标记。本包只处理合成患者资料，登记时统一写入。
@@ -160,6 +162,67 @@ type EffectiveRecord struct {
 	Version     int
 	Content     string
 	EffectiveAt time.Time
+}
+
+// 交换状态：创建后待回执，接收方登记回执后转为已接受或已拒绝。
+const (
+	ExchangePending  = "pending_receipt"
+	ExchangeAccepted = "accepted"
+	ExchangeRejected = "rejected"
+)
+
+// 回执结果：接受或拒绝打包内容。
+const (
+	ReceiptAccepted = "accepted"
+	ReceiptRejected = "rejected"
+)
+
+// PackagedRecord 是包内固化的一条记录版本。包在创建时取各记录的当前生效
+// 版本快照：此后记录被更正或新增版本都不会改写包内容。
+//
+// 只含核对所需的标识、版本号、生效时间与完整内容，不含患者姓名、草稿、
+// 历史版本或更正原因（Version.Reason）。
+type PackagedRecord struct {
+	EncounterID ID
+	Category    string
+	RecordID    ID
+	VersionID   ID
+	Version     int
+	EffectiveAt time.Time
+	Content     string
+}
+
+// Package 是一份已固化的交换内容：只含患者与接收方标识及各记录的版本快照。
+type Package struct {
+	PatientID  ID
+	ReceiverID string
+	Records    []PackagedRecord
+}
+
+// Receipt 是接收方对一份包的回执。接受时 Reason 为空；拒绝时 Reason 必填。
+type Receipt struct {
+	Outcome      string
+	Reason       string
+	RegisteredAt time.Time
+}
+
+// Exchange 是把已授权记录打包给指定接收方的一次交换。
+//
+// 创建即把当时的当前版本固化进 Package 并计算摘要；状态初始为待回执。
+// 请求号（RequestID）按发起的内部使用者区分，用于安全重试：同一使用者以
+// 相同请求号、患者、接收方、绑定授权与记录集合重试时返回原交换。
+type Exchange struct {
+	ID              ID
+	PatientID       ID
+	ReceiverID      string
+	AuthorizationID ID
+	RequestID       string
+	CreatorID       string // 创建交换的内部使用者标识
+	Status          string // ExchangePending/Accepted/Rejected
+	Digest          string // 包内容摘要，接收方回执时须原样回传
+	Package         Package
+	Receipt         *Receipt
+	CreatedAt       time.Time
 }
 
 // 失败一律返回明确错误，不留下半条记录。

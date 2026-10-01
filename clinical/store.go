@@ -27,6 +27,7 @@ type snapshot struct {
 	Records        map[string]*Record        `json:"records"`
 	Versions       map[string]*Version       `json:"versions"`
 	Authorizations map[string]*Authorization `json:"authorizations"`
+	Exchanges      map[string]*Exchange      `json:"exchanges"`
 	AuditEvents    []*AuditEvent             `json:"audit_events"`
 }
 
@@ -133,6 +134,9 @@ func ensureMaps(snap *snapshot) {
 	if snap.Authorizations == nil {
 		snap.Authorizations = map[string]*Authorization{}
 	}
+	if snap.Exchanges == nil {
+		snap.Exchanges = map[string]*Exchange{}
+	}
 }
 
 // Close 刷新并释放数据目录。Close 后任何业务方法返回 ErrClosed。
@@ -210,6 +214,7 @@ func cloneSnapshot(in *snapshot) *snapshot {
 		Records:        make(map[string]*Record, len(in.Records)),
 		Versions:       make(map[string]*Version, len(in.Versions)),
 		Authorizations: make(map[string]*Authorization, len(in.Authorizations)),
+		Exchanges:      make(map[string]*Exchange, len(in.Exchanges)),
 		AuditEvents:    make([]*AuditEvent, 0, len(in.AuditEvents)),
 	}
 	for k, v := range in.Patients {
@@ -237,6 +242,15 @@ func cloneSnapshot(in *snapshot) *snapshot {
 			a.RevokedAt = &t
 		}
 		out.Authorizations[k] = &a
+	}
+	for k, x := range in.Exchanges {
+		y := *x
+		y.Package.Records = append([]PackagedRecord(nil), x.Package.Records...)
+		if x.Receipt != nil {
+			r := *x.Receipt
+			y.Receipt = &r
+		}
+		out.Exchanges[k] = &y
 	}
 	for _, ev := range in.AuditEvents {
 		e := *ev
