@@ -13,11 +13,20 @@ const (
 
 // 审计动作。
 const (
-	ActionActivated   = "activated"
-	ActionCorrected   = "corrected"
-	ActionGranted     = "authorization_granted"
-	ActionRevoked     = "authorization_revoked"
-	ActionDeactivated = "patient_deactivated"
+	ActionActivated       = "activated"
+	ActionCorrected       = "corrected"
+	ActionGranted         = "authorization_granted"
+	ActionRevoked         = "authorization_revoked"
+	ActionDeactivated     = "patient_deactivated"
+	ActionExchangeCreated = "exchange_created"
+	ActionExchangeReceipt = "exchange_receipt_registered"
+)
+
+// 交换状态与回执结果。
+const (
+	ExchangePending  = "pending"
+	ExchangeAccepted = "accepted"
+	ExchangeRejected = "rejected"
 )
 
 // 合成数据标记。本包只处理合成患者资料，登记时统一写入。
@@ -160,6 +169,60 @@ type EffectiveRecord struct {
 	Version     int
 	Content     string
 	EffectiveAt time.Time
+}
+
+// ExchangeRecord 是封入交换包的一条记录在创建时刻的固化内容：
+// 就诊、类别、记录与版本标识、版本号、生效时间与完整内容。
+// 不含姓名、草稿、其他历史版本或更正原因。
+type ExchangeRecord struct {
+	EncounterID ID
+	Category    string
+	RecordID    ID
+	VersionID   ID
+	Version     int
+	EffectiveAt time.Time
+	Content     string
+}
+
+// ExchangePackage 是交换的密封内容：只含患者与接收方标识，
+// 以及各记录在创建时刻的当前版本快照。
+type ExchangePackage struct {
+	PatientID  ID
+	ReceiverID string
+	Records    []ExchangeRecord // 按记录标识升序排列
+}
+
+// Exchange 是内部使用者打包给指定接收方的一次交换。
+// 包内容在创建时固化：此后记录更正或新增都不会改写它，
+// 现有 Read 仍返回当前生效版本。
+type Exchange struct {
+	ID              ID
+	PatientID       ID
+	ReceiverID      string
+	AuthorizationID ID
+	RequesterID     string // 发起交换的内部使用者
+	RequestKey      string // 发起方内部使用者维度的请求号
+	CreatedAt       time.Time
+	Status          string // ExchangePending / ExchangeAccepted / ExchangeRejected
+	Package         ExchangePackage
+	Summary         string // 用于核对包内容的摘要
+
+	// 回执登记后填充；待回执状态下为空。
+	ReceiptResult  string // ExchangeAccepted / ExchangeRejected
+	ReceiptReason  string
+	ReceiptActorID string
+	ReceiptAt      *time.Time
+}
+
+// ReceiptConfirmation 是回执登记的响应：只包含确认状态，
+// 不携带任何受保护的包内容。
+type ReceiptConfirmation struct {
+	ExchangeID ID
+	Status     string // 回执后的状态：accepted / rejected
+	Result     string
+	Reason     string
+	ActorID    string
+	At         time.Time
 }
 
 // 失败一律返回明确错误，不留下半条记录。
