@@ -1,6 +1,7 @@
 # 本地临床记录与交换
 
-这是一个在本机运行的 本地临床记录与交换。当前基线只提供可编译、可测试的起点。
+在本机运行的临床档案与授权查阅库（Go 包），只处理**合成患者资料**。数据以
+JSON 快照原子写入调用方指定的目录，关闭后从同一位置重新打开可完整恢复。
 
 ## 使用
 
@@ -8,4 +9,62 @@
 go test ./...
 ```
 
-测试通过表示基线包可以加载。后续能力在这个模块上继续增加。
+## 能力概览
+
+- `clinical.Open(dir)` 打开/创建本地数据目录（带文件锁，同一目录不允许两个进程同时打开）；`Store.Close()` 关闭。
+- **患者与就诊**：内部使用者登记合成患者与就诊，患者、就诊、记录、版本、授权均有稳定标识；引用不存在的对象或跨患者混用数据会明确失败，不留下半条记录。
+- **草稿 → 生效 → 更正**：诊断/医嘱先存为草稿，可改可删；`ActivateRecord` 固化当时的完整内容与时间。生效记录不可直接覆盖或删除；`CorrectRecord` 必须带非空原因和当前版本号，成功后生成新版本（保留旧内容、`PrevID` 版本链与原因），版本过期返回 `ErrConflict`。
+- **授权与接收方读取**：`Grant` 范围由明确的“就诊 + 诊断/医嘱类别”组成，带 `[开始, 截止)` 时间窗；空范围、跨患者就诊、开始不早于截止均拒绝。接收方 `Read` 只能看到有效授权覆盖记录的当前生效版本，看不到草稿、旧版本或更正原因；未开始、已到期、已撤回或无授权一律返回 `ErrAccessDenied`。多授权独立判断，撤回互不影响；可 `Revoke` 提前撤回。
+- **停用**：停用后不能新增就诊、改草稿、生效、更正、新建授权，接收方也不能继续读取；内部使用者仍能查看完整历史。重复停用/撤回幂等，不产生额外变化。
+- **审计**：生效、更正、授权创建与撤回、档案停用均记录操作身份、时间、对象与动作，仅供内部使用者按患者查看。
+- 成功的业务变更与其审计事件在同一次原子写盘中保留；失败操作不改变任何已有状态。
+
+## 最小示例
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+
+    "github.com/bengzyyys/clinical-exchange/clinical"
+)
+
+func main() {
+    doc := clinical.InternalActor("doctor-1")
+    ins := clinical.ReceiverActor("insurer-1")
+
+    s, _ := clinical.Open("./data")
+    defer s.Close()
+
+    p, _ := s.RegisterPatient(doc, "合成患者甲")
+    e, _ := s.AddEncounter(doc, p.ID, time.Now())
+
+    r, _ := s.CreateDraft(doc, p.ID, e.ID, clinical.Diagnosis, "高血压 I10")
+    v1, _ := s.ActivateRecord(doc, r.ID)
+
+    // 为接收方授权该就诊下的诊断，时间窗 [now, now+24h)
+    now := time.Now()
+    a, _ := s.Grant(doc, p.ID, ins.ID,
+        []clinical.Scope{{EncounterID: e.ID, Category: clinical.Diagnosis}},
+        now, now.Add(24*time.Hour))
+
+    // 接收方按自己的身份读取，只能拿到当前生效版本
+    res, err := s.Read(ins, p.ID, e.ID, clinical.Diagnosis)
+    fmt.Println(res, err)
+
+    // 更正：必须指明当前版本号与非空原因
+    _, _ = s.CorrectRecord(doc, r.ID, v1.Number, "高血压 I10（复核确认）", "补录依据")
+    _ = a
+}
+```
+
+## 身份模型
+
+| 身份 | 能力 |
+| --- | --- |
+| 内部使用者 `InternalActor` | 登记、草稿/生效/更正、授权与撤回、查看全部草稿、完整历史与审计 |
+| 接收方 `ReceiverActor` | 仅在有效授权范围内读取当前生效版本 |
+
+`clinical.Ready()` 保持基线行为，始终返回 `true`。
