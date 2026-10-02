@@ -34,9 +34,11 @@ type ReceiptConfirmation struct {
 // 指定接收方。
 //
 // 参数：患者、接收方、绑定授权、记录标识集合与非空请求号。记录必须属于该
-// 患者且已经生效，其就诊与类别均被绑定授权的范围覆盖，授权必须属于该患者
-// 与接收方且在当前时间有效。空集合、空白请求号、不存在或跨患者的引用、
-// 夹带草稿、授权不符一律拒绝，不留下交换或审计。患者停用后不能新建交换。
+// 患者且已经生效；每条记录都必须被绑定的那一条授权覆盖——整类范围按记录的
+// 就诊+类别覆盖，限定范围只覆盖明确选中的记录，不能借用同一接收方的其他
+// 授权补足。授权必须属于该患者与接收方且在当前时间有效。空集合、空白请求号、
+// 不存在或跨患者的引用、夹带草稿、记录不被绑定授权覆盖、授权不符一律拒绝，
+// 不留下交换或审计，也不占用请求号。患者停用后不能新建交换。
 //
 // 成功后包内容固化为创建时各记录的当前生效版本（重复记录标识合并），并计算
 // 稳定摘要，状态为待回执；交换与审计事件在同一次原子落盘中保留。此后记录被
@@ -131,7 +133,9 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 			if v == nil {
 				return fmt.Errorf("%w: current version %q of record %q", ErrNotFound, r.CurrentVersionID, rid)
 			}
-			if !authorizationCovers(a, r.EncounterID, r.Category) {
+			// 每条记录都必须被绑定授权自身覆盖：整类范围或限定范围。
+			// 同一接收方的其他授权不能补足；夹带一条未覆盖记录即整包拒绝。
+			if !authorizationCoversRecord(a, r) {
 				return fmt.Errorf("%w: record %q (encounter %q, category %q) is not covered by authorization %q",
 					ErrAccessDenied, rid, r.EncounterID, r.Category, authorizationID)
 			}
