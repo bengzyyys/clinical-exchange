@@ -83,6 +83,126 @@ func (s *Store) Grant(actor Actor, patientID ID, receiverID string, scopes []Sco
 	return result, err
 }
 
+// GrantSelected 由内部使用者为一名接收方建立针对某患者的读取授权，
+// 可同时包含整类范围（scopes）与限定记录范围（selected），两者可并存。
+//
+// scopes 为整类范围，允许为空（纯限定授权）；selected 为明确选中的已生效
+// 记录，不允许为空——空选择不能被当成整类授权。每条选中记录必须存在、
+// 属于该患者、已经生效（非草稿），且与声明的就诊、类别一致。
+// 重复选择同一记录只算一次。任一选择不合法即拒绝整条授权，不保存合法部分，
+// 不新增审计。时间窗、患者停用、原子落盘等规则与 Grant 相同。
+func (s *Store) GrantSelected(actor Actor, patientID ID, receiverID string, scopes []Scope, selected []SelectedRecord, startsAt, expiresAt time.Time) (Authorization, error) {
+	if !actor.valid() || !actor.IsInternal() {
+		return Authorization{}, ErrAccessDenied
+	}
+	if patientID == "" {
+		return Authorization{}, fmt.Errorf("%w: patient id is required", ErrInvalidArgument)
+	}
+	if strings.TrimSpace(receiverID) == "" {
+		return Authorization{}, fmt.Errorf("%w: receiver id is required", ErrInvalidArgument)
+	}
+	if len(selected) == 0 {
+		return Authorization{}, fmt.Errorf("%w: selected records must not be empty", ErrInvalidArgument)
+	}
+	for _, sc := range scopes {
+		if sc.EncounterID == "" {
+			return Authorization{}, fmt.Errorf("%w: scope encounter id is required", ErrInvalidArgument)
+		}
+		if !validCategory(sc.Category) {
+			return Authorization{}, fmt.Errorf("%w: scope category must be %q or %q", ErrInvalidArgument, Diagnosis, Order)
+		}
+	}
+	for _, sr := range selected {
+		if strings.TrimSpace(sr.RecordID) == "" {
+			return Authorization{}, fmt.Errorf("%w: selected record id must not be blank", ErrInvalidArgument)
+		}
+		if sr.EncounterID == "" {
+			return Authorization{}, fmt.Errorf("%w: selected record encounter id is required", ErrInvalidArgument)
+		}
+		if !validCategory(sr.Category) {
+			return Authorization{}, fmt.Errorf("%w: selected record category must be %q or %q", ErrInvalidArgument, Diagnosis, Order)
+		}
+	}
+	if !startsAt.Before(expiresAt) {
+		return Authorization{}, fmt.Errorf("%w: starts-at must be strictly before expires-at", ErrInvalidArgument)
+	}
+
+	var result Authorization
+	err := s.mutate(func(snap *snapshot) error {
+		if _, err := requireActivePatient(snap, patientID); err != nil {
+			return err
+		}
+
+		// 整类范围：去重并校验就诊存在且属于该患者。
+		seenScopes := map[Scope]bool{}
+		cleanedScopes := make([]Scope, 0, len(scopes))
+		for _, sc := range scopes {
+			if _, err := requireEncounter(snap, patientID, sc.EncounterID); err != nil {
+				return err
+			}
+			if seenScopes[sc] {
+				continue
+			}
+			seenScopes[sc] = true
+			cleanedScopes = append(cleanedScopes, sc)
+		}
+		sort.Slice(cleanedScopes, func(i, j int) bool {
+			if cleanedScopes[i].EncounterID != cleanedScopes[j].EncounterID {
+				return cleanedScopes[i].EncounterID < cleanedScopes[j].EncounterID
+			}
+			return cleanedScopes[i].Category < cleanedScopes[j].Category
+		})
+
+		// 限定范围：逐条校验记录存在、属于患者、已生效、与声明的就诊+类别一致。
+		// 重复选择同一记录只算一次。任一不合法即拒绝整条授权。
+		seenRecords := map[ID]bool{}
+		cleanedSelected := make([]SelectedRecord, 0, len(selected))
+		for _, sr := range selected {
+			r := snap.Records[sr.RecordID]
+			if r == nil {
+				return fmt.Errorf("%w: record %q", ErrNotFound, sr.RecordID)
+			}
+			if r.PatientID != patientID {
+				return fmt.Errorf("%w: record %q belongs to patient %q, not %q",
+					ErrMismatchedPatient, sr.RecordID, r.PatientID, patientID)
+			}
+			if r.CurrentVersionID == "" {
+				return fmt.Errorf("%w: record %q has no effective version; activate its draft first",
+					ErrInvalidArgument, sr.RecordID)
+			}
+			if r.EncounterID != sr.EncounterID || r.Category != sr.Category {
+				return fmt.Errorf("%w: record %q (encounter %q, category %q) does not match declared encounter %q, category %q",
+					ErrInvalidArgument, sr.RecordID, r.EncounterID, r.Category, sr.EncounterID, sr.Category)
+			}
+			if seenRecords[sr.RecordID] {
+				continue
+			}
+			seenRecords[sr.RecordID] = true
+			cleanedSelected = append(cleanedSelected, sr)
+		}
+		sort.Slice(cleanedSelected, func(i, j int) bool {
+			return cleanedSelected[i].RecordID < cleanedSelected[j].RecordID
+		})
+
+		now := s.now()
+		a := &Authorization{
+			ID:              newID("auth"),
+			PatientID:       patientID,
+			ReceiverID:      receiverID,
+			Scopes:          cleanedScopes,
+			SelectedRecords: cleanedSelected,
+			StartsAt:        startsAt.UTC(),
+			ExpiresAt:       expiresAt.UTC(),
+			CreatedAt:       now,
+		}
+		snap.Authorizations[a.ID] = a
+		s.addAudit(snap, patientID, actor, ActionGranted, "authorization", a.ID, now)
+		result = *a
+		return nil
+	})
+	return result, err
+}
+
 // Revoke 提前撤回授权。撤回在当前时间生效；此后该授权不再覆盖任何读取。
 // 重复撤回返回成功且不产生额外变化（不新增审计事件），与“停用”语义一致。
 // 撤回其他患者的授权 ID 会得到 ErrMismatchedPatient/ErrNotFound。
@@ -159,12 +279,14 @@ func (s *Store) ListAuthorizations(actor Actor, patientID ID, receiverID string)
 
 // Read 供接收方按自己的身份读取某次就诊下某个类别（诊断/医嘱）的内容。
 //
-// 只返回在“本次读取时间”被有效授权覆盖的记录的当前生效版本：
-// 授权必须属于该接收方与该患者、范围包含该就诊+类别、已开始、未到期且未撤回；
-// 患者档案必须未停用。看不到草稿、旧版本或更正原因；授权范围内后来生效
-// 或更正后的记录会自然包含（读取的是当前版本），但不会自动扩大到新增就诊。
+// 返回在“本次读取时间”被有效授权覆盖的记录的当前生效版本合集：
+// 整类范围覆盖该就诊+类别下的全部已生效记录；限定范围只覆盖明确选中的记录。
+// 多条有效授权的覆盖范围取并集，每条记录只出现一次，按记录标识稳定排序。
+// 授权必须属于该接收方与该患者、已开始、未到期且未撤回；患者档案必须未停用。
+// 看不到草稿、旧版本或更正原因；授权范围内后来生效或更正后的记录会自然包含
+// （读取的是当前版本），但限定范围不会自动扩大到新增记录或新增就诊。
 //
-// 若不存在任何覆盖该就诊+类别的授权，或所有相关授权都尚未开始、已到期
+// 若不存在任何覆盖该就诊+类别的有效授权，或所有相关授权都尚未开始、已到期
 // 或已撤回，返回 ErrAccessDenied，结果中不含任何受保护内容。
 func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (ReadResult, error) {
 	if !actor.valid() || actor.Kind != "receiver" {
@@ -180,14 +302,17 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 	now := s.now()
 	var out ReadResult
 	err := s.view(func(snap *snapshot) error {
-		// 先看是否存在覆盖该接收方 + 患者 + 就诊 + 类别的有效授权。
-		// 不提前区分“对象不存在/属于他人”与“无授权”，统一返回拒绝，
-		// 从而不向接收方泄露患者或就诊是否存在。
-		covered := false
+		// 先看患者是否停用。
 		patientDeactivated := false
 		if p := snap.Patients[patientID]; p != nil {
 			patientDeactivated = p.Deactivated
 		}
+
+		// 收集所有有效授权覆盖的记录标识（并集，每条只出现一次）。
+		// 不提前区分“对象不存在/属于他人”与“无授权”，统一返回拒绝，
+		// 从而不向接收方泄露患者或就诊是否存在。
+		coveredIDs := map[ID]bool{}
+		anyCovered := false
 		for _, a := range snap.Authorizations {
 			if a.PatientID != patientID || a.ReceiverID != actor.ID {
 				continue
@@ -195,18 +320,38 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 			if !a.ActiveAt(now) {
 				continue
 			}
+			// 整类范围：覆盖该就诊+类别下的全部已生效记录。
 			if authorizationCovers(a, encounterID, category) {
-				covered = true
-				break
+				anyCovered = true
+				for _, r := range snap.Records {
+					if r.EncounterID != encounterID || r.Category != category || r.PatientID != patientID {
+						continue
+					}
+					if r.CurrentVersionID != "" {
+						coveredIDs[r.ID] = true
+					}
+				}
+			}
+			// 限定范围：只覆盖明确选中的记录。
+			for _, sr := range a.SelectedRecords {
+				if sr.EncounterID != encounterID || sr.Category != category {
+					continue
+				}
+				anyCovered = true
+				r := snap.Records[sr.RecordID]
+				if r != nil && r.PatientID == patientID && r.CurrentVersionID != "" {
+					coveredIDs[r.ID] = true
+				}
 			}
 		}
-		if !covered || patientDeactivated {
+
+		if !anyCovered || patientDeactivated {
 			// 无授权、未开始、已到期、已撤回或档案停用：明确拒绝，
 			// 结果中不含任何受保护内容。
 			return ErrAccessDenied
 		}
 
-		// 能被授权覆盖的就诊必然属于该患者（Grant 时已校验），
+		// 能被授权覆盖的就诊必然属于该患者（Grant/GrantSelected 时已校验），
 		// 此处再确认一次以防任何不一致状态。
 		e := snap.Encounters[encounterID]
 		if e == nil || e.PatientID != patientID {
@@ -216,14 +361,14 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 		out.EncounterID = encounterID
 		out.Category = category
 		var recs []EffectiveRecord
-		for _, r := range snap.Records {
-			if r.EncounterID != encounterID || r.Category != category || r.PatientID != patientID {
+		for rid := range coveredIDs {
+			r := snap.Records[rid]
+			if r == nil {
 				continue
 			}
 			if eff, ok := currentEffective(snap, r); ok {
 				recs = append(recs, eff)
 			}
-			// 仅有草稿、尚无生效版本的记录天然不出现。
 		}
 		sort.Slice(recs, func(i, j int) bool { return recs[i].RecordID < recs[j].RecordID })
 		out.Records = recs
@@ -232,9 +377,29 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 	return out, err
 }
 
+// authorizationCovers 报告授权是否包含覆盖该就诊+类别的整类范围。
+// 限定范围不由此函数判断（限定范围只覆盖明确选中的记录，不覆盖整类）。
 func authorizationCovers(a *Authorization, encounterID ID, category string) bool {
 	for _, sc := range a.Scopes {
 		if sc.EncounterID == encounterID && sc.Category == category {
+			return true
+		}
+	}
+	return false
+}
+
+// authorizationCoversRecord 报告授权是否覆盖指定记录：
+// 整类范围覆盖该就诊+类别下的全部记录；限定范围只覆盖明确选中的记录。
+// 用于 CreateExchange 的逐记录校验——每条记录必须被绑定的那一条授权覆盖，
+// 不能借用同一接收方的其他授权补足。
+func authorizationCoversRecord(a *Authorization, recordID ID, encounterID, category string) bool {
+	for _, sc := range a.Scopes {
+		if sc.EncounterID == encounterID && sc.Category == category {
+			return true
+		}
+	}
+	for _, sr := range a.SelectedRecords {
+		if sr.RecordID == recordID {
 			return true
 		}
 	}

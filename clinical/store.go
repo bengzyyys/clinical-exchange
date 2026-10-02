@@ -237,6 +237,7 @@ func cloneSnapshot(in *snapshot) *snapshot {
 	for k, v := range in.Authorizations {
 		a := *v
 		a.Scopes = append([]Scope(nil), v.Scopes...)
+		a.SelectedRecords = append([]SelectedRecord(nil), v.SelectedRecords...)
 		if v.RevokedAt != nil {
 			t := *v.RevokedAt
 			a.RevokedAt = &t

@@ -131,7 +131,7 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 			if v == nil {
 				return fmt.Errorf("%w: current version %q of record %q", ErrNotFound, r.CurrentVersionID, rid)
 			}
-			if !authorizationCovers(a, r.EncounterID, r.Category) {
+			if !authorizationCoversRecord(a, r.ID, r.EncounterID, r.Category) {
 				return fmt.Errorf("%w: record %q (encounter %q, category %q) is not covered by authorization %q",
 					ErrAccessDenied, rid, r.EncounterID, r.Category, authorizationID)
 			}

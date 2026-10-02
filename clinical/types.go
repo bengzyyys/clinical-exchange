@@ -102,16 +102,18 @@ type Record struct {
 }
 
 // Authorization 是内部使用者为一名接收方建立的、针对某患者的读取授权。
-// 范围由明确的“就诊 + 类别”组合构成，仅在 [StartsAt, ExpiresAt) 内有效。
+// 范围由明确的“就诊 + 类别”组合（整类范围）与明确选中的记录（限定范围）构成，
+// 两者可并存；仅在 [StartsAt, ExpiresAt) 内有效。
 type Authorization struct {
-	ID         ID
-	PatientID  ID
-	ReceiverID string
-	Scopes     []Scope
-	StartsAt   time.Time
-	ExpiresAt  time.Time
-	RevokedAt  *time.Time // 撤回时间；nil 表示未撤回
-	CreatedAt  time.Time
+	ID              ID
+	PatientID       ID
+	ReceiverID      string
+	Scopes          []Scope
+	SelectedRecords []SelectedRecord `json:"selected_records,omitempty"`
+	StartsAt        time.Time
+	ExpiresAt       time.Time
+	RevokedAt       *time.Time // 撤回时间；nil 表示未撤回
+	CreatedAt       time.Time
 }
 
 // ActiveAt 报告授权在时刻 t 是否有效：已开始、未到期、未撤回。
@@ -133,6 +135,15 @@ func (a *Authorization) ActiveAt(t time.Time) bool {
 type Scope struct {
 	EncounterID ID
 	Category    string
+}
+
+// SelectedRecord 是授权中明确限定的一条已生效记录。
+// 限定范围只覆盖该记录本身：同就诊同类的其他记录、后来新增并生效的记录
+// 都不会自动进入范围。记录被更正后，授权覆盖其当前版本。
+type SelectedRecord struct {
+	EncounterID ID
+	Category    string
+	RecordID    ID
 }
 
 // AuditEvent 是一条仅供内部使用者按患者查看的审计事件。
