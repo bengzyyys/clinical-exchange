@@ -148,7 +148,7 @@ func (s *Store) Close() error {
 	}
 	unlockFile(s.lock)
 	err := s.lock.Close()
-	if rmErr := os.Remove(filepath.Join(s.dir, ".clinical.lock")); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
+	if rmErr := removeLockFile(filepath.Join(s.dir, ".clinical.lock")); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
 		err = rmErr
 	}
 	s.lock = nil

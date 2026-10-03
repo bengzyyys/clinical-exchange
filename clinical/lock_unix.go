@@ -20,3 +20,9 @@ func tryLockFile(f *os.File) error {
 func unlockFile(f *os.File) {
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
+
+// removeLockFile 在关闭后删除锁文件标记。Unix 下即使文件被其他句柄打开
+// 也允许解除链接，且占用与否完全由 flock 锁（而非文件是否存在）决定。
+func removeLockFile(path string) error {
+	return os.Remove(path)
+}
