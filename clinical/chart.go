@@ -105,8 +105,15 @@ func (s *Store) EncounterRecords(actor Actor, patientID, encounterID ID) ([]Reco
 }
 
 func buildHistory(snap *snapshot, r *Record) RecordHistory {
+	rec := *r
+	// 返回的记录只是本次查询得到的独立信息。view 直接读在活快照上，
+	// 若版本标识列表共享底层数组，调用方改写返回结果里的 Record.Versions
+	// （换成空值或其他记录的版本标识）就会污染正式历史。这里复制一份：
+	// 本地修改不进入库内状态，先后取得的两份结果、完整档案与单次就诊的
+	// 结果也互不影响；草稿没有版本，保留 nil 原样。
+	rec.Versions = append([]ID(nil), r.Versions...)
 	rh := RecordHistory{
-		Record:       *r,
+		Record:       rec,
 		DraftContent: r.DraftContent,
 		HasDraft:     r.HasDraft,
 	}
