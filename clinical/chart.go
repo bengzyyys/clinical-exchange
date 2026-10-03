@@ -105,8 +105,13 @@ func (s *Store) EncounterRecords(actor Actor, patientID, encounterID ID) ([]Reco
 }
 
 func buildHistory(snap *snapshot, r *Record) RecordHistory {
+	// 返回的记录必须是独立副本：Versions 切片与存储中的记录共享底层数组时，
+	// 调用方改动查询结果会写回正式历史。这里深拷贝，保证修改手中的结果
+	// 只影响该结果本身。
+	rec := *r
+	rec.Versions = append([]ID(nil), r.Versions...)
 	rh := RecordHistory{
-		Record:       *r,
+		Record:       rec,
 		DraftContent: r.DraftContent,
 		HasDraft:     r.HasDraft,
 	}
