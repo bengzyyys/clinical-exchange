@@ -611,3 +611,143 @@ func TestOperationsAfterCloseFail(t *testing.T) {
 		t.Fatalf("register after close err = %v", err)
 	}
 }
+
+// ---- 返回的授权是独立副本 ----
+
+func TestReturnedAuthorizationIsDetachedCopy(t *testing.T) {
+	s, clk := newTestStore(t)
+	pid, eid := setupPatientEncounter(t, s)
+
+	mkRec := func(content string) ID {
+		t.Helper()
+		r, err := s.CreateDraft(doc, pid, eid, Diagnosis, content)
+		if err != nil {
+			t.Fatalf("create draft: %v", err)
+		}
+		if _, err := s.ActivateRecord(doc, r.ID); err != nil {
+			t.Fatalf("activate: %v", err)
+		}
+		return r.ID
+	}
+	d1 := mkRec("d1")
+	d2 := mkRec("d2")
+	d3 := mkRec("d3")
+
+	t0 := clk.t.Add(-time.Hour)
+	t1 := clk.t.Add(time.Hour)
+
+	// 整类范围：把返回结果中的类别改成医嘱，不改变真实的诊断授权。
+	ga, err := s.Grant(doc, pid, "rcv-a", []Scope{{EncounterID: eid, Category: Diagnosis}}, t0, t1)
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	ga.Scopes[0].Category = Order
+	got, err := s.GetAuthorization(doc, pid, ga.ID)
+	if err != nil {
+		t.Fatalf("get auth: %v", err)
+	}
+	if len(got.Scopes) != 1 || got.Scopes[0].Category != Diagnosis {
+		t.Fatalf("stored scope rewritten via returned value: %+v", got.Scopes)
+	}
+	if _, err := s.Read(rcv, pid, eid, Order); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("receiver read order err = %v, want ErrAccessDenied", err)
+	}
+	if res, err := s.Read(rcv, pid, eid, Diagnosis); err != nil || len(res.Records) != 3 {
+		t.Fatalf("receiver read diagnosis = %+v, %v", res, err)
+	}
+
+	// 限定范围：把返回结果中的记录标识换成同类第三条记录，
+	// 第三条不能因此进入授权；原本两条仍按既有规则可读。
+	sa, err := s.GrantSelective(doc, pid, "rcv-b", nil, []RecordSelection{
+		{EncounterID: eid, Category: Diagnosis, RecordID: d2},
+		{EncounterID: eid, Category: Diagnosis, RecordID: d1},
+	}, t0, t1)
+	if err != nil {
+		t.Fatalf("grant selective: %v", err)
+	}
+	if len(sa.Selections) != 2 {
+		t.Fatalf("selections = %+v", sa.Selections)
+	}
+	sa.Selections[0].RecordID = d3
+	gotSel, err := s.GetAuthorization(doc, pid, sa.ID)
+	if err != nil {
+		t.Fatalf("get selective auth: %v", err)
+	}
+	selIDs := map[ID]bool{}
+	for _, sel := range gotSel.Selections {
+		selIDs[sel.RecordID] = true
+	}
+	if len(selIDs) != 2 || !selIDs[d1] || !selIDs[d2] || selIDs[d3] {
+		t.Fatalf("stored selections rewritten via returned value: %+v", gotSel.Selections)
+	}
+
+	// 只改了返回结果就把未覆盖的记录夹带进交换：拒绝且不留下交换或审计。
+	audBefore, err := s.AuditEvents(doc, pid)
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if _, err := s.CreateExchange(doc, pid, "rcv-b", sa.ID, []ID{d3}, "req-denied"); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("exchange with uncovered record err = %v, want ErrAccessDenied", err)
+	}
+	if xs, err := s.ListExchanges(doc, pid); err != nil || len(xs) != 0 {
+		t.Fatalf("denied exchange persisted: %+v, %v", xs, err)
+	}
+	audAfter, _ := s.AuditEvents(doc, pid)
+	if len(audAfter) != len(audBefore) {
+		t.Fatalf("denied exchange left audit: %d -> %d", len(audBefore), len(audAfter))
+	}
+	// 原本获准的记录不因此失去授权。
+	if _, err := s.CreateExchange(doc, pid, "rcv-b", sa.ID, []ID{d1, d2}, "req-ok"); err != nil {
+		t.Fatalf("exchange with covered records: %v", err)
+	}
+
+	// 从同一授权取得的多份结果彼此独立。
+	c1, err := s.GetAuthorization(doc, pid, ga.ID)
+	if err != nil {
+		t.Fatalf("get copy 1: %v", err)
+	}
+	c2, err := s.GetAuthorization(doc, pid, ga.ID)
+	if err != nil {
+		t.Fatalf("get copy 2: %v", err)
+	}
+	c1.Scopes[0].Category = Order
+	if c2.Scopes[0].Category != Diagnosis {
+		t.Fatalf("mutating one copy affected another: %+v", c2.Scopes)
+	}
+	// ListAuthorizations 的返回结果同样只是副本。
+	la, err := s.ListAuthorizations(doc, pid, "rcv-a")
+	if err != nil || len(la) != 1 {
+		t.Fatalf("list auths = %+v, %v", la, err)
+	}
+	la[0].Scopes[0].Category = Order
+	gotAgain, _ := s.GetAuthorization(doc, pid, ga.ID)
+	if gotAgain.Scopes[0].Category != Diagnosis {
+		t.Fatalf("stored scope rewritten via listed value: %+v", gotAgain.Scopes)
+	}
+
+	// 已撤回授权：改返回结果中的撤回时间或本地清空它，
+	// 不能更改真实撤回时间或恢复访问。
+	if err := s.Revoke(doc, pid, ga.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	ra, err := s.GetAuthorization(doc, pid, ga.ID)
+	if err != nil {
+		t.Fatalf("get revoked auth: %v", err)
+	}
+	if ra.RevokedAt == nil {
+		t.Fatal("revoked auth has no revoked-at")
+	}
+	saved := *ra.RevokedAt
+	*ra.RevokedAt = saved.Add(48 * time.Hour)
+	ra.RevokedAt = nil
+	ra2, err := s.GetAuthorization(doc, pid, ga.ID)
+	if err != nil {
+		t.Fatalf("re-get revoked auth: %v", err)
+	}
+	if ra2.RevokedAt == nil || !ra2.RevokedAt.Equal(saved) {
+		t.Fatalf("revoked-at rewritten via returned value: %v, want %v", ra2.RevokedAt, saved)
+	}
+	if _, err := s.Read(rcv, pid, eid, Diagnosis); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("read after local clear of revoked-at err = %v, want ErrAccessDenied", err)
+	}
+}

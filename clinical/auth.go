@@ -147,7 +147,7 @@ func (s *Store) GrantSelective(actor Actor, patientID ID, receiverID string, sco
 		}
 		snap.Authorizations[a.ID] = a
 		s.addAudit(snap, patientID, actor, ActionGranted, "authorization", a.ID, now)
-		result = *a
+		result = cloneAuthorizationValue(a)
 		return nil
 	})
 	return result, err
@@ -195,7 +195,7 @@ func (s *Store) GetAuthorization(actor Actor, patientID, authorizationID ID) (Au
 			return fmt.Errorf("%w: authorization %q belongs to patient %q, not %q",
 				ErrMismatchedPatient, authorizationID, a.PatientID, patientID)
 		}
-		result = *a
+		result = cloneAuthorizationValue(a)
 		return nil
 	})
 	return result, err
@@ -219,7 +219,7 @@ func (s *Store) ListAuthorizations(actor Actor, patientID ID, receiverID string)
 			if receiverID != "" && a.ReceiverID != receiverID {
 				continue
 			}
-			result = append(result, *a)
+			result = append(result, cloneAuthorizationValue(a))
 		}
 		sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 		return nil
@@ -314,6 +314,21 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 		return nil
 	})
 	return out, err
+}
+
+// cloneAuthorizationValue 返回授权的深拷贝：整类范围、限定范围与撤回时间
+// 都与库内保存的对象各自独立。返回给调用方的授权只是本次操作得到的信息；
+// 调用方在本地修改它（改范围、换记录标识、改撤回时间）不能改变库内正式
+// 保存的授权，从同一授权取得的多份结果也互不影响。
+func cloneAuthorizationValue(a *Authorization) Authorization {
+	out := *a
+	out.Scopes = append([]Scope(nil), a.Scopes...)
+	out.Selections = append([]RecordSelection(nil), a.Selections...)
+	if a.RevokedAt != nil {
+		t := *a.RevokedAt
+		out.RevokedAt = &t
+	}
+	return out
 }
 
 // authorizationCovers 报告授权的整类范围是否覆盖某次就诊下某个类别。
