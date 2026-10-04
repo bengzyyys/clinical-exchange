@@ -221,6 +221,116 @@ func TestReadTimeWindowBoundaries(t *testing.T) {
 	}
 }
 
+// ---- 读取时刻：等待结束、开始核对权限的同一时刻 ----
+
+// readWhileStoreBusy 模拟读取请求发出后被同一存储上的其他操作阻塞：
+// 先占用存储互斥锁，再在阻塞期间把时钟推进到 advanceTo，随后放行读取。
+// 返回读取最终的结果与错误。
+func readWhileStoreBusy(s *Store, clk *fakeClock, advanceTo time.Time, pid, eid ID, category string) (ReadResult, error) {
+	s.mu.Lock()
+	type outcome struct {
+		res ReadResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := s.Read(rcv, pid, eid, category)
+		done <- outcome{res, err}
+	}()
+	// 给读取 goroutine 留出进入 Read 并阻塞在锁上的时间，确保请求
+	// 是在时钟推进之前发出的。
+	time.Sleep(50 * time.Millisecond)
+	clk.t = advanceTo
+	s.mu.Unlock()
+	o := <-done
+	return o.res, o.err
+}
+
+func TestReadJudgesGrantsAtCheckTimeNotRequestTime(t *testing.T) {
+	s, clk := newTestStore(t)
+	pid, eid := setupPatientEncounter(t, s)
+	rec, _ := s.CreateDraft(doc, pid, eid, Diagnosis, "x")
+	if _, err := s.ActivateRecord(doc, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	start := clk.t.Add(-time.Hour)
+	end := clk.t.Add(time.Hour)
+	if _, err := s.Grant(doc, pid, rcv.ID, []Scope{{EncounterID: eid, Category: Diagnosis}}, start, end); err != nil {
+		t.Fatal(err)
+	}
+
+	// 发出请求时授权尚未到期，但等待期间到达截止时刻：核对权限时授权
+	// 已失效，必须拒绝，且结果不携带记录标识、数量或内容。
+	res, err := readWhileStoreBusy(s, clk, end, pid, eid, Diagnosis)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("grant expired during wait: err = %v, want ErrAccessDenied", err)
+	}
+	if res.EncounterID != "" || res.Category != "" || len(res.Records) != 0 {
+		t.Fatalf("denied read must not carry record info: %+v", res)
+	}
+
+	// 反向：发出请求时第二个授权尚未开始，等待期间进入其时间窗且未到期：
+	// 应按核对时刻允许读取。
+	start2 := end.Add(30 * time.Minute)
+	end2 := start2.Add(2 * time.Hour)
+	if _, err := s.Grant(doc, pid, rcv.ID, []Scope{{EncounterID: eid, Category: Diagnosis}}, start2, end2); err != nil {
+		t.Fatal(err)
+	}
+	clk.t = end // 请求发出时刻：授权一已到期，授权二尚未开始
+	res, err = readWhileStoreBusy(s, clk, start2.Add(time.Minute), pid, eid, Diagnosis)
+	if err != nil {
+		t.Fatalf("grant started during wait must allow read: %v", err)
+	}
+	if len(res.Records) != 1 || res.Records[0].RecordID != rec.ID {
+		t.Fatalf("read after wait = %+v, want the one effective record", res)
+	}
+}
+
+func TestReadWaitExpiryFallsBackToStillValidSelectiveGrant(t *testing.T) {
+	s, clk := newTestStore(t)
+	pid, eid := setupPatientEncounter(t, s)
+	mkDiag := func(content string) ID {
+		t.Helper()
+		r, err := s.CreateDraft(doc, pid, eid, Diagnosis, content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ActivateRecord(doc, r.ID); err != nil {
+			t.Fatal(err)
+		}
+		return r.ID
+	}
+	r1 := mkDiag("诊断1")
+	r2 := mkDiag("诊断2")
+
+	start := clk.t.Add(-time.Hour)
+	end := clk.t.Add(time.Hour)
+	// 整类授权在等待期间到期；限定授权只选中 r2，且在核对时刻仍有效。
+	if _, err := s.Grant(doc, pid, rcv.ID, []Scope{{EncounterID: eid, Category: Diagnosis}}, start, end); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GrantSelective(doc, pid, rcv.ID, nil,
+		[]RecordSelection{{EncounterID: eid, Category: Diagnosis, RecordID: r2}},
+		start, end.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 发出请求时整类授权仍有效；核对权限时它已到期：只返回仍有效的
+	// 限定授权明确选中的 r2，已到期的整类授权不能带出 r1，也不能因此
+	// 拒绝全部读取。
+	res, err := readWhileStoreBusy(s, clk, end, pid, eid, Diagnosis)
+	if err != nil {
+		t.Fatalf("selective grant still valid: %v", err)
+	}
+	if len(res.Records) != 1 || res.Records[0].RecordID != r2 {
+		t.Fatalf("read = %+v, want only the selected record %q", res.Records, r2)
+	}
+	if res.Records[0].RecordID == r1 {
+		t.Fatal("expired whole-category grant leaked an unselected record")
+	}
+}
+
 // ---- 撤回：多授权独立、幂等 ----
 
 func TestMultipleGrantsSameReceiverJudgedIndependently(t *testing.T) {

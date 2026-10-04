@@ -229,7 +229,10 @@ func (s *Store) ListAuthorizations(actor Actor, patientID ID, receiverID string)
 
 // Read 供接收方按自己的身份读取某次就诊下某个类别（诊断/医嘱）的内容。
 //
-// 结果是该接收方在“本次读取时间”所有当前有效授权允许记录的合集，每条记录
+// 结果是该接收方在“本次读取时间”所有当前有效授权允许记录的合集。“本次读取
+// 时间”指真正开始核对权限的时刻：请求发出后若因等待同一存储上的其他操作而
+// 排队，以等待结束、开始核对时的同一时刻统一判断本次涉及的各条授权是否有效，
+// 等待本身不会延长或推迟授权的有效期。每条记录
 // 只出现一次并按记录标识稳定排序：授权必须属于该接收方与该患者、已开始、
 // 未到期且未撤回；整类范围（Scope）允许该就诊+类别下的全部已生效记录
 // （含授权后才生效者），限定范围（RecordSelection）仅允许明确选中的记录。
@@ -250,9 +253,12 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 		return ReadResult{}, fmt.Errorf("%w: category must be %q or %q", ErrInvalidArgument, Diagnosis, Order)
 	}
 
-	now := s.now()
 	var out ReadResult
 	err := s.view(func(snap *snapshot) error {
+		// 查阅时刻在进入临界区、真正开始核对权限时才取样：请求发出后若因
+		// 等待其他操作而排队，等待时间不能延长或推迟授权的有效判断——
+		// 本次读取涉及的所有授权统一按这同一时刻判断是否有效。
+		now := s.now()
 		// 汇总当前有效的授权：哪些整类（就诊+类别）被覆盖，哪些具体记录被
 		// 限定范围明确允许。不提前区分“对象不存在/属于他人”与“无授权”，
 		// 统一返回拒绝，从而不向接收方泄露患者或就诊是否存在。
