@@ -21,8 +21,8 @@ func unlockFile(f *os.File) {
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
-// removeLockFile 在关闭后删除锁文件标记。Unix 下即使文件被其他句柄打开
-// 也允许解除链接，且占用与否完全由 flock 锁（而非文件是否存在）决定。
-func removeLockFile(path string) error {
-	return os.Remove(path)
-}
+// 锁文件在关闭后不删除（与 Windows 一致）：占用与否完全由 flock 锁决定，
+// 文件是否存在从不作为判据。若在解锁后删除文件，已打开旧 inode 并完成
+// 加锁的接手方会与随后新建锁文件的第三个调用方各持一把不同 inode 上的锁，
+// 两个 Store 将同时操作同一目录。保留残留标记不会影响重开——没有存活句柄
+// 持锁时 flock 立即成功。

@@ -140,6 +140,10 @@ func ensureMaps(snap *snapshot) {
 }
 
 // Close 刷新并释放数据目录。Close 后任何业务方法返回 ErrClosed。
+//
+// 锁文件标记保留在目录里（不删除）：占用状态完全由锁本身决定，残留的
+// 标记文件不代表仍有人占用，也不会阻止下一次打开。删除标记反而会在
+// “关闭与接手交错”时让不同调用方锁住不同 inode，破坏独占。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,9 +152,6 @@ func (s *Store) Close() error {
 	}
 	unlockFile(s.lock)
 	err := s.lock.Close()
-	if rmErr := removeLockFile(filepath.Join(s.dir, ".clinical.lock")); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
-		err = rmErr
-	}
 	s.lock = nil
 	s.data = nil
 	return err
