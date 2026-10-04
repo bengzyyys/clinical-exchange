@@ -495,6 +495,75 @@ func TestOpenFailureReleasesDirectory(t *testing.T) {
 	}
 }
 
+// ---- 关闭与接手交错：旧 Store 余下的关闭动作不能破坏新 Store 的独占 ----
+
+func TestCloseOpenInterleavingKeepsExclusivity(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s1.RegisterPatient(doc, "交接患者")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 还原关闭与接手的最坏交错：s1 的 Close 先释放文件锁（尚未走完全部
+	// 关闭动作），此刻 s2 合法接手同一目录；随后 s1 才完成余下的关闭动作。
+	// s1 余下的动作（关闭句柄、清理锁标记）绝不能打断 s2 的独占。
+	unlockFile(s1.lock)
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("takeover during predecessor close must succeed: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	if err := s1.Close(); err != nil {
+		t.Fatalf("predecessor finishing close: %v", err)
+	}
+
+	// s2 占用期间，任何第三个调用方（本进程内）都必须立即被拒绝。
+	s3, err := Open(dir)
+	if err == nil {
+		_ = s3.Close()
+		t.Fatal("third Open must be rejected while successor holds the directory")
+	}
+	if s3 != nil {
+		t.Fatalf("rejected Open must return nil handle, got %#v", s3)
+	}
+	if !strings.Contains(err.Error(), alreadyInUseMsg) {
+		t.Fatalf("error does not say directory is in use: %v", err)
+	}
+
+	// 旧 Store 保持已关闭语义，不因交接复活；再次关闭也不影响新 Store。
+	if _, err := s1.RegisterPatient(doc, "旧句柄患者"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("old handle method err = %v, want ErrClosed", err)
+	}
+	if err := s1.Close(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("old handle second Close err = %v, want ErrClosed", err)
+	}
+
+	// 新 Store 读到接手前已提交的数据，并能继续正常保存。
+	if got, err := s2.GetPatient(doc, p.ID); err != nil || got.Name != "交接患者" {
+		t.Fatalf("successor cannot read committed data: %+v, %v", got, err)
+	}
+	if _, err := s2.RegisterPatient(doc, "接手后患者"); err != nil {
+		t.Fatalf("successor cannot save after interleaved close: %v", err)
+	}
+
+	// 新 Store 正常关闭后目录释放，之后可再次打开。
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s4, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after successor close: %v", err)
+	}
+	t.Cleanup(func() { _ = s4.Close() })
+	if got, err := s4.GetPatient(doc, p.ID); err != nil || got.Name != "交接患者" {
+		t.Fatalf("data lost across handoff: %+v, %v", got, err)
+	}
+}
+
 // ---- 关闭后的旧句柄不因新 Store 打开同一目录而复活 ----
 
 func TestClosedHandleStaysClosedAfterReopen(t *testing.T) {
