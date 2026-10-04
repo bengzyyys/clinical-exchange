@@ -234,8 +234,19 @@ func (s *Store) FetchPackage(actor Actor, exchangeID ID) (PackageDelivery, error
 //
 // 非法结果、拒绝时原因为空白返回 ErrInvalidArgument。只有指定接收方且摘要
 // 吻合，才能把交换从待回执变为已接受或已拒绝；摘要不符返回 ErrConflict，
-// 状态不变。相同回执（结果与原因均相同）重交返回原确认，不新增审计；结果
-// 或原因改变返回 ErrConflict。其他身份不能代交，不存在的交换统一拒绝。
+// 状态不变。相同回执（接受不看原因；拒绝须结果与原因原文均相同）重交返回
+// 原确认，不新增审计；结果或原因改变返回 ErrConflict。其他身份不能代交，
+// 不存在的交换统一拒绝。
+//
+// 命中已保存回执的重交只是确认既有登记、不产生任何状态变更，因此不落盘：
+// 即使本地保存条件当前不可用，重交也成功返回首次登记时的原确认——交换标识、
+// 交换状态、回执结果与登记时间与首次确认完全一致，当前时间变化不重设登记
+// 时间；内部视图中的正式回执、原包内容、摘要、拒绝原因与既有审计均保持原样。
+// 这只适用于已成功登记的回执：交换仍待回执时，首次登记必须真正保存成功，
+// 本地保存失败仍明确报错，交换保持待回执、无正式回执或新增审计，此前失败
+// 过的提交不能当作已登记的回执确认。摘要不符、改用另一种合法结果或另一段
+// 非空白拒绝原因仍返回 ErrConflict，不会因当前无法保存而变成保存错误，
+// 也不能用重复提交覆盖原回执。
 //
 // 授权失效或患者停用后仍允许登记此前包的回执，但响应只返回确认状态，
 // 不提供任何受保护内容。
@@ -271,14 +282,16 @@ func (s *Store) SubmitReceipt(actor Actor, exchangeID ID, digest, outcome, reaso
 			if x.Receipt.Outcome != outcome || x.Receipt.Reason != reason {
 				return fmt.Errorf("%w: exchange %q already has a different receipt", ErrConflict, exchangeID)
 			}
-			// 相同回执重交：返回原确认，不新增审计、不改状态。
+			// 相同回执重交：只确认既有的正式登记，返回原确认，不新增审计、
+			// 不改状态、不落盘——即使本地保存条件当前不可用也必须成功返回，
+			// 登记时间沿用正式回执的原始时间，不按当前时间重设。
 			conf = ReceiptConfirmation{
 				ExchangeID:   x.ID,
 				Status:       x.Status,
 				Outcome:      x.Receipt.Outcome,
 				RegisteredAt: x.Receipt.RegisteredAt,
 			}
-			return nil
+			return errUnchanged
 		}
 
 		now := s.now()
