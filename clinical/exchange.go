@@ -175,8 +175,16 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 //
 // 每次取包都重新检查绑定授权与患者状态：授权必须仍是创建时绑定的那一条且
 // 已开始、未到期、未撤回，患者档案必须未停用；其他有效授权不能替代绑定授权。
-// 授权未开始、到期、撤回或患者停用后返回 ErrAccessDenied，不返回包内容或摘要。
+// 是否允许取包按“本次核对时间”判断：请求发出后若因等待同一存储上的其他操作
+// 而排队，以等待结束、真正开始核对本次取包权限的时刻为准（进入临界区后才
+// 取样，与接收方 Read 的时间含义一致），提前发出的请求不会延长授权有效期；
+// 时间窗仍是半开区间 [开始, 截止)，恰好到达截止时刻即失效。授权未开始、
+// 到期、撤回或患者停用后返回 ErrAccessDenied，交付结果为空，不返回包内容、
+// 摘要、记录标识或交换状态。
 // 其他接收方、内部使用者以及不存在的交换统一拒绝，不泄露交换是否存在。
+//
+// 成功时返回交换创建时固化的包及其摘要与当前状态；此后记录被更正也不会
+// 重新打包，包内版本与内容仍以创建时保存的为准。
 func (s *Store) FetchPackage(actor Actor, exchangeID ID) (PackageDelivery, error) {
 	if !actor.valid() || actor.Kind != "receiver" {
 		return PackageDelivery{}, ErrAccessDenied
@@ -185,9 +193,12 @@ func (s *Store) FetchPackage(actor Actor, exchangeID ID) (PackageDelivery, error
 		return PackageDelivery{}, fmt.Errorf("%w: exchange id is required", ErrInvalidArgument)
 	}
 
-	now := s.now()
 	var out PackageDelivery
 	err := s.view(func(snap *snapshot) error {
+		// 核对时刻在进入临界区、真正开始核对本次取包权限时才取样：请求发出后
+		// 若因等待其他操作而排队，等待时间不能延长绑定授权的有效判断——
+		// 是否可取一律按这同一时刻判断，与 Read 的时间含义一致。
+		now := s.now()
 		x := snap.Exchanges[exchangeID]
 		if x == nil || x.ReceiverID != actor.ID {
 			// 不存在或属于其他接收方：统一拒绝，不泄露存在性。

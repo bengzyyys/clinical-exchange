@@ -397,6 +397,170 @@ func TestFetchPackageRechecksBinding(t *testing.T) {
 	}
 }
 
+// ---- 取包时刻：等待结束、开始核对绑定授权的同一时刻 ----
+
+// fetchWhileStoreBusy 模拟取包请求发出后被同一存储上的其他操作阻塞：
+// 先占用存储互斥锁，再在阻塞期间把时钟推进到 advanceTo，随后放行取包。
+// 返回取包最终的交付与错误。
+func fetchWhileStoreBusy(s *Store, clk *fakeClock, advanceTo time.Time, actor Actor, exchangeID ID) (PackageDelivery, error) {
+	s.mu.Lock()
+	type outcome struct {
+		del PackageDelivery
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		del, err := s.FetchPackage(actor, exchangeID)
+		done <- outcome{del, err}
+	}()
+	// 给取包 goroutine 留出进入 FetchPackage 并阻塞在锁上的时间，确保请求
+	// 是在时钟推进之前发出的。
+	time.Sleep(50 * time.Millisecond)
+	clk.t = advanceTo
+	s.mu.Unlock()
+	o := <-done
+	return o.del, o.err
+}
+
+func emptyDelivery(d PackageDelivery) bool {
+	return d.ExchangeID == "" && d.Status == "" && d.Digest == "" &&
+		d.CreatedAt.IsZero() && d.Package.PatientID == "" && d.Package.ReceiverID == "" &&
+		len(d.Package.Records) == 0
+}
+
+func TestFetchPackageJudgesBindingAtCheckTimeNotRequestTime(t *testing.T) {
+	f := setupExchange(t)
+	x, err := f.s.CreateExchange(doc, f.pid, rcv.ID, f.auth.ID, []ID{f.diag, f.ord}, "req-wait")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 另一条同患者、同接收方、覆盖相同记录且在核对时刻仍有效的授权：
+	// 绑定授权到期后也不能用它替代。
+	otherAuth, err := f.s.Grant(doc, f.pid, rcv.ID,
+		[]Scope{{EncounterID: f.e1, Category: Diagnosis}, {EncounterID: f.e1, Category: Order}},
+		f.start, f.end.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = otherAuth
+
+	// 请求在截止前一分钟发出，等待期间恰好到达截止时刻：核对时绑定授权
+	// 已失效，必须拒绝；交付为空，不携带包内容、摘要、记录标识或交换状态。
+	f.clk.t = f.end.Add(-time.Minute)
+	del, err := fetchWhileStoreBusy(f.s, f.clk, f.end, rcv, x.ID)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("binding expired during wait: err = %v, want ErrAccessDenied", err)
+	}
+	if !emptyDelivery(del) {
+		t.Fatalf("denied delivery must carry no exchange info: %+v", del)
+	}
+
+	// 核对发生在截止前一刻（仍有等待）：其他条件满足，取包成功，
+	// 返回创建时固化的包与摘要、当前状态。
+	f.clk.t = f.end.Add(-2 * time.Minute)
+	del, err = fetchWhileStoreBusy(f.s, f.clk, f.end.Add(-time.Nanosecond), rcv, x.ID)
+	if err != nil {
+		t.Fatalf("check just before expiry must succeed: %v", err)
+	}
+	if del.ExchangeID != x.ID || del.Digest != x.Digest || del.Status != ExchangePending {
+		t.Fatalf("bad delivery: %+v", del)
+	}
+	if len(del.Package.Records) != 2 {
+		t.Fatalf("delivery records = %d, want 2", len(del.Package.Records))
+	}
+
+	// 没有等待的正常取包同样遵守半开边界：恰好截止时刻失效，
+	// 截止前一纳秒仍可取，边界语义与 Read 完全一致。
+	f.clk.t = f.end
+	if del, err := f.s.FetchPackage(rcv, x.ID); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("fetch exactly at expiry: err = %v, want ErrAccessDenied, delivery = %+v", err, del)
+	}
+	f.clk.t = f.end.Add(-time.Nanosecond)
+	if _, err := f.s.FetchPackage(rcv, x.ID); err != nil {
+		t.Fatalf("fetch just before expiry: %v", err)
+	}
+}
+
+// fetchWhileStoreBusyLocked 在已持有存储锁的前提下发起取包，等待 goroutine
+// 阻塞在锁上后执行 mutate（直接改动内存快照）再放行：用于模拟“请求先发出、
+// 其他操作先完成、本次核对随后才开始”的排队场景。
+func fetchWhileStoreBusyLocked(s *Store, mutate func(snap *snapshot, now time.Time), actor Actor, exchangeID ID) (PackageDelivery, error) {
+	done := make(chan struct {
+		del PackageDelivery
+		err error
+	}, 1)
+	go func() {
+		del, err := s.FetchPackage(actor, exchangeID)
+		done <- struct {
+			del PackageDelivery
+			err error
+		}{del, err}
+	}()
+	// 给取包 goroutine 留出进入 FetchPackage 并阻塞在锁上的时间，确保请求
+	// 是在下面的状态改动之前发出的。
+	time.Sleep(50 * time.Millisecond)
+	mutate(s.data, s.now())
+	s.mu.Unlock()
+	o := <-done
+	return o.del, o.err
+}
+
+// 等待期间绑定授权被撤回或患者档案被停用：核对时按最新状态拒绝；即使存在
+// 另一条同患者、同接收方、覆盖相同记录且仍有效的授权也不能替代，交付为空。
+func TestFetchPackageWaitHitsRevocationAndDeactivation(t *testing.T) {
+	f := setupExchange(t)
+	x, err := f.s.CreateExchange(doc, f.pid, rcv.ID, f.auth.ID, []ID{f.diag}, "req-wait-rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherAuth, err := f.s.Grant(doc, f.pid, rcv.ID,
+		[]Scope{{EncounterID: f.e1, Category: Diagnosis}}, f.start, f.end.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = otherAuth
+
+	// 请求发出时绑定授权仍有效；等待期间（由先完成的其他操作）撤回，
+	// 本次核对开始时它已撤回：拒绝且交付为空。
+	f.s.mu.Lock()
+	del, err := fetchWhileStoreBusyLocked(f.s, func(snap *snapshot, now time.Time) {
+		if a := snap.Authorizations[f.auth.ID]; a != nil {
+			revoked := now
+			a.RevokedAt = &revoked
+		}
+	}, rcv, x.ID)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("binding revoked during wait: err = %v, want ErrAccessDenied", err)
+	}
+	if !emptyDelivery(del) {
+		t.Fatalf("denied delivery must carry no exchange info: %+v", del)
+	}
+
+	// 第二份交换：等待期间患者档案被停用，核对时必须拒绝。
+	orderAuth, err := f.s.Grant(doc, f.pid, rcv.ID,
+		[]Scope{{EncounterID: f.e1, Category: Order}}, f.start, f.end.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x2, err := f.s.CreateExchange(doc, f.pid, rcv.ID, orderAuth.ID, []ID{f.ord}, "req-wait-deact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.mu.Lock()
+	del2, err := fetchWhileStoreBusyLocked(f.s, func(snap *snapshot, now time.Time) {
+		if p := snap.Patients[f.pid]; p != nil {
+			p.Deactivated = true
+		}
+	}, rcv, x2.ID)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("patient deactivated during wait: err = %v, want ErrAccessDenied", err)
+	}
+	if !emptyDelivery(del2) {
+		t.Fatalf("denied delivery must carry no exchange info: %+v", del2)
+	}
+}
+
 // ---- 回执登记 ----
 
 func TestSubmitReceiptAcceptAndReject(t *testing.T) {
