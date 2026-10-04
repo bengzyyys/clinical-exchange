@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -158,9 +159,15 @@ func (s *Store) Close() error {
 
 func (s *Store) now() time.Time { return s.clock().UTC() }
 
+// errUnchanged 由 mutate 的 fn 返回，表示本次操作只读取了既有结果、
+// 没有产生任何状态变更（例如幂等重试命中已保存的结果）：直接成功返回，
+// 不触发落盘。这样重试即使赶上本地保存条件不可用，也能返回原结果。
+var errUnchanged = errors.New("clinical: no state change")
+
 // mutate 在状态的深拷贝上执行业务变更。fn 返回错误时，拷贝连同其中的
 // 半成品一并丢弃，磁盘与既有业务状态保持原样；fn 返回 nil 时整体原子落盘。
 // 这样“引用不存在的对象/跨患者混用”等失败都不会留下半条记录。
+// fn 返回 errUnchanged 时视为成功但不落盘：状态没有任何变化，无需重写数据。
 func (s *Store) mutate(fn func(*snapshot) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -170,6 +177,9 @@ func (s *Store) mutate(fn func(*snapshot) error) error {
 
 	clone := cloneSnapshot(s.data)
 	if err := fn(clone); err != nil {
+		if errors.Is(err, errUnchanged) {
+			return nil
+		}
 		return err
 	}
 	if err := s.persist(clone); err != nil {

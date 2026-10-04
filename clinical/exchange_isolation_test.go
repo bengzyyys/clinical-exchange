@@ -657,13 +657,17 @@ func TestLocalMutationsDoNotPersistAcrossReopen(t *testing.T) {
 	}
 	tamperDeliveryResult(&d)
 
-	// 触发一次真实的整体原子写盘（幂等重试会克隆当前状态并落盘）。
+	// 触发一次真实的整体原子写盘：对医嘱记录做一次合法更正（幂等重试只是
+	// 读取已保存的结果，本身不再落盘）。更正不改写已创建交换的冻结包。
+	if _, err := s.CorrectRecord(doc, recO.ID, 1, "医嘱内容-更正版", "触发一次真实落盘"); err != nil {
+		t.Fatalf("correction that forces persist: %v", err)
+	}
 	again, err := s.CreateExchange(doc, p.ID, rcv.ID, a.ID,
 		[]ID{recD.ID, recO.ID}, "req-reopen-iso")
 	if err != nil {
-		t.Fatalf("retry that forces persist: %v", err)
+		t.Fatalf("retry after persist: %v", err)
 	}
-	assertExchangeMatches(t, again, want, "force-persist retry still returns original")
+	assertExchangeMatches(t, again, want, "retry after persist still returns original")
 
 	if err := s.Close(); err != nil {
 		t.Fatal(err)

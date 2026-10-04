@@ -47,6 +47,8 @@ type ReceiptConfirmation struct {
 // 请求号按发起的内部使用者区分：同一使用者以相同请求号携带相同患者、接收方、
 // 授权与记录集合（顺序不限）重试时，返回原交换及其现有状态，不重新取内容、
 // 不新增审计；其他参数变化返回 ErrConflict。首次失败不占用请求号。
+// 命中已保存交换的重试只是读取既有结果、不产生任何状态变更，因此不再落盘：
+// 即使本地保存条件当前不可用，重试也成功返回正式保存的那份交换。
 func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizationID ID, recordIDs []ID, requestID string) (Exchange, error) {
 	if !actor.valid() || !actor.IsInternal() {
 		return Exchange{}, ErrAccessDenied
@@ -87,7 +89,9 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 				result.Receipt = &r
 			}
 			result.Package.Records = append([]PackagedRecord(nil), existing.Package.Records...)
-			return nil
+			// 命中已保存的交换：没有任何状态变更，不落盘——即使本地保存
+			// 条件当前不可用，重试也必须成功返回原交换。
+			return errUnchanged
 		}
 
 		// 首次创建：患者必须存在且未停用。
