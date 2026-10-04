@@ -229,16 +229,21 @@ func (s *Store) ListAuthorizations(actor Actor, patientID ID, receiverID string)
 
 // Read 供接收方按自己的身份读取某次就诊下某个类别（诊断/医嘱）的内容。
 //
-// 结果是该接收方在“本次读取时间”所有当前有效授权允许记录的合集，每条记录
-// 只出现一次并按记录标识稳定排序：授权必须属于该接收方与该患者、已开始、
-// 未到期且未撤回；整类范围（Scope）允许该就诊+类别下的全部已生效记录
-// （含授权后才生效者），限定范围（RecordSelection）仅允许明确选中的记录。
-// 同一条记录被多条授权（含整类与限定重叠）允许也只出现一次；被选记录被
-// 更正后读取其当前生效版本。看不到草稿、旧版本或更正原因。
+// 结果是该接收方在“权限核对时刻”所有当前有效授权允许记录的合集，每条记录
+// 只出现一次并按记录标识稳定排序。核对时刻取等待同一存储上的其他操作结束、
+// 真正开始核对权限的那一刻（而非请求发出时）：请求可能因锁竞争而等待，等待
+// 时间不能延长或提前授权期限。授权必须属于该接收方与该患者，并在这同一时刻
+// 已开始、未到期且未撤回；一次读取涉及的各条授权统一按该时刻判断。整类范围
+// （Scope）允许该就诊+类别下的全部已生效记录（含授权后才生效者），限定范围
+// （RecordSelection）仅允许明确选中的记录。同一条记录被多条授权（含整类与
+// 限定重叠）允许也只出现一次；被选记录被更正后读取其当前生效版本。看不到草稿、
+// 旧版本或更正原因。
 //
-// 若不存在任何覆盖所请求就诊+类别的有效授权（全部尚未开始、已到期或已
-// 撤回），或患者档案已停用，返回 ErrAccessDenied：结果中不含任何未授权
-// 记录的标识、数量或内容。撤回整类授权后，只剩其他有效授权明确允许的记录。
+// 若在核对时刻不存在任何覆盖所请求就诊+类别的有效授权（全部尚未开始、已到期
+// 或已撤回），或患者档案已停用，返回 ErrAccessDenied：结果中不含任何未授权
+// 记录的标识、版本、数量或内容。只合并核对时刻仍有效的授权：整类授权已到期、
+// 仅剩限定授权有效时，只返回后者明确选中的记录；撤回整类授权后，只剩其他有效
+// 授权明确允许的记录。
 func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (ReadResult, error) {
 	if !actor.valid() || actor.Kind != "receiver" {
 		return ReadResult{}, ErrAccessDenied
@@ -250,12 +255,13 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 		return ReadResult{}, fmt.Errorf("%w: category must be %q or %q", ErrInvalidArgument, Diagnosis, Order)
 	}
 
-	now := s.now()
 	var out ReadResult
-	err := s.view(func(snap *snapshot) error {
-		// 汇总当前有效的授权：哪些整类（就诊+类别）被覆盖，哪些具体记录被
-		// 限定范围明确允许。不提前区分“对象不存在/属于他人”与“无授权”，
-		// 统一返回拒绝，从而不向接收方泄露患者或就诊是否存在。
+	_, err := s.viewAt(func(snap *snapshot, now time.Time) error {
+		// 授权有效性统一按拿到锁、真正开始核对的同一时刻判断：等待其他
+		// 本地操作的时间既不会延长也不会提前任何一条授权的有效期。
+		// 汇总该时刻仍有效的授权：哪些整类（就诊+类别）被覆盖，哪些具体
+		// 记录被限定范围明确允许。不提前区分“对象不存在/属于他人”与“无
+		// 授权”，统一返回拒绝，从而不向接收方泄露患者或就诊是否存在。
 		wholeCategory := false
 		allowedRecords := map[ID]bool{}
 		patientDeactivated := false

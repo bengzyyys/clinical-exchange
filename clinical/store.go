@@ -189,6 +189,22 @@ func (s *Store) view(fn func(*snapshot) error) error {
 	return fn(s.data)
 }
 
+// viewAt 在只读快照上执行依赖“当前时刻”的查询，并返回该时刻。
+//
+// 时刻在拿到锁之后才读取：若调用方因同一存储上的其他操作而在锁上等待，
+// 等待时间不计入授权期限——所有时限判断统一使用等待结束、真正开始核对
+// 那一刻的同一时间，而不是请求发出时（可能已过期）的时间。fn 必须以
+// 传入的 at 作为唯一时间依据，不得自行再取时钟。
+func (s *Store) viewAt(fn func(snap *snapshot, at time.Time) error) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data == nil {
+		return time.Time{}, ErrClosed
+	}
+	at := s.now()
+	return at, fn(s.data, at)
+}
+
 func (s *Store) persist(snap *snapshot) error {
 	raw, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
