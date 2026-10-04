@@ -117,6 +117,9 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 			// 未开始、已到期或已撤回：没有覆盖此次打包的有效授权。
 			return fmt.Errorf("%w: authorization %q is not active", ErrAccessDenied, authorizationID)
 		}
+		// 覆盖含义只取自绑定的这一条授权本身（与接收方 Read 使用同一套
+		// 判定），同一接收方的其他授权不会并入、不能补足。
+		cov := coverageOf(a)
 
 		// 逐记录固化当前生效版本；重复标识已合并，按记录标识排序保证确定性。
 		pkg := Package{PatientID: patientID, ReceiverID: receiverID}
@@ -139,7 +142,7 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 			}
 			// 每条记录都必须被绑定授权自身覆盖：整类范围或限定范围。
 			// 同一接收方的其他授权不能补足；夹带一条未覆盖记录即整包拒绝。
-			if !authorizationCoversRecord(a, r) {
+			if !cov.coversRecord(r) {
 				return fmt.Errorf("%w: record %q (encounter %q, category %q) is not covered by authorization %q",
 					ErrAccessDenied, rid, r.EncounterID, r.Category, authorizationID)
 			}
