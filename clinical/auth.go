@@ -259,11 +259,11 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 		// 等待其他操作而排队，等待时间不能延长或推迟授权的有效判断——
 		// 本次读取涉及的所有授权统一按这同一时刻判断是否有效。
 		now := s.now()
-		// 汇总当前有效的授权：哪些整类（就诊+类别）被覆盖，哪些具体记录被
-		// 限定范围明确允许。不提前区分“对象不存在/属于他人”与“无授权”，
-		// 统一返回拒绝，从而不向接收方泄露患者或就诊是否存在。
-		wholeCategory := false
-		allowedRecords := map[ID]bool{}
+		// 合并该患者、该接收方所有当前有效授权的覆盖：整类范围与限定范围的
+		// 解释与创建交换共用同一套判定（grantCoverage），不在这里另写一份。
+		// 不提前区分“对象不存在/属于他人”与“无授权”，统一返回拒绝，从而不
+		// 向接收方泄露患者或就诊是否存在。
+		coverage := newGrantCoverage()
 		patientDeactivated := false
 		if p := snap.Patients[patientID]; p != nil {
 			patientDeactivated = p.Deactivated
@@ -273,20 +273,16 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 				continue
 			}
 			if !a.ActiveAt(now) {
+				// 未开始、已到期或已撤回的授权不参与覆盖。
 				continue
 			}
-			if authorizationCovers(a, encounterID, category) {
-				wholeCategory = true
-			}
-			for _, sel := range a.Selections {
-				if sel.EncounterID == encounterID && sel.Category == category {
-					allowedRecords[sel.RecordID] = true
-				}
-			}
+			coverage.add(a)
 		}
-		if patientDeactivated || (!wholeCategory && len(allowedRecords) == 0) {
+		if patientDeactivated || !coverage.coversRequest(encounterID, category) {
 			// 无授权、未开始、已到期、已撤回或档案停用：明确拒绝，
-			// 结果中不含任何受保护内容。
+			// 结果中不含任何受保护内容。整类授权覆盖该就诊+类别但其中暂时
+			// 没有生效记录时，coversRequest 仍为真，随后成功返回空集合，
+			// 不会把“有授权无记录”误判成拒绝。
 			return ErrAccessDenied
 		}
 
@@ -304,9 +300,10 @@ func (s *Store) Read(actor Actor, patientID, encounterID ID, category string) (R
 			if r.EncounterID != encounterID || r.Category != category || r.PatientID != patientID {
 				continue
 			}
-			// 整类范围覆盖全部；限定范围只覆盖明确选中的记录。
-			// 多个授权、整类与限定重叠时同一条记录只出现一次。
-			if !wholeCategory && !allowedRecords[r.ID] {
+			// 整类范围覆盖全部（含授权后才生效者）；限定范围只覆盖明确选中
+			// 的记录，同类其他记录与后来新增记录不被覆盖。多条授权、整类与
+			// 限定重叠时同一条记录只出现一次。
+			if !coverage.coversRecord(r) {
 				continue
 			}
 			if eff, ok := currentEffective(snap, r); ok {
@@ -335,29 +332,4 @@ func cloneAuthorizationValue(a *Authorization) Authorization {
 		out.RevokedAt = &t
 	}
 	return out
-}
-
-// authorizationCovers 报告授权的整类范围是否覆盖某次就诊下某个类别。
-func authorizationCovers(a *Authorization, encounterID ID, category string) bool {
-	for _, sc := range a.Scopes {
-		if sc.EncounterID == encounterID && sc.Category == category {
-			return true
-		}
-	}
-	return false
-}
-
-// authorizationCoversRecord 报告授权本身（整类范围或限定范围）是否覆盖
-// 某条具体记录：整类范围按记录的就诊+类别覆盖，限定范围只覆盖明确选中
-// 的记录。其他授权不能替代该绑定授权完成覆盖。
-func authorizationCoversRecord(a *Authorization, r *Record) bool {
-	if authorizationCovers(a, r.EncounterID, r.Category) {
-		return true
-	}
-	for _, sel := range a.Selections {
-		if sel.RecordID == r.ID {
-			return true
-		}
-	}
-	return false
 }

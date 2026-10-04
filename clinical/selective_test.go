@@ -480,6 +480,91 @@ func TestCreateExchangeMixedAuthorizationScopes(t *testing.T) {
 	}
 }
 
+// ---- 同一条授权在“接收方查阅”与“创建交换”中的覆盖含义必须一致 ----
+//
+// 两个功能共用同一套范围解释：任一记录要么两处都覆盖，要么两处都不覆盖；
+// 限定范围不外溢、整类范围包含授权后生效记录、覆盖不串到其他就诊，这些结论
+// 在查阅与打包两条路径上必须相同。
+
+func TestCoverageConsistentAcrossReadAndExchange(t *testing.T) {
+	f := setupSelective(t)
+
+	// 同一条混合授权：整类覆盖 e1 医嘱；选定 e1 诊断 r1。
+	grant, err := f.s.GrantSelective(doc, f.pid, rcv.ID,
+		[]Scope{{EncounterID: f.e1, Category: Order}},
+		[]RecordSelection{sel(f.e1, Diagnosis, f.r1)},
+		f.start, f.end)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 查阅：诊断只见明确选中的 r1，同类的 r2 不出现。
+	diag, err := f.s.Read(rcv, f.pid, f.e1, Diagnosis)
+	if err != nil {
+		t.Fatalf("read diagnosis: %v", err)
+	}
+	if ids := readRecordIDs(diag); len(ids) != 1 || !ids[f.r1] {
+		t.Fatalf("diagnosis read = %+v, want only selected r1", diag.Records)
+	}
+	// 查阅：整类医嘱见 r3。
+	ord, err := f.s.Read(rcv, f.pid, f.e1, Order)
+	if err != nil {
+		t.Fatalf("read order: %v", err)
+	}
+	if ids := readRecordIDs(ord); len(ids) != 1 || !ids[f.r3] {
+		t.Fatalf("order read = %+v, want whole-category r3", ord.Records)
+	}
+
+	// 与查阅一致：r1、r3 各自由这条绑定授权打包成功；r2 两处都不覆盖。
+	packagable := func(rid ID) bool {
+		_, perr := f.s.CreateExchange(doc, f.pid, rcv.ID, grant.ID,
+			[]ID{rid}, "req-"+rid)
+		return perr == nil
+	}
+	if !packagable(f.r1) {
+		t.Fatal("selected r1 must be packageable by the bound grant")
+	}
+	if !packagable(f.r3) {
+		t.Fatal("whole-category r3 must be packageable by the bound grant")
+	}
+	if packagable(f.r2) {
+		t.Fatal("non-selected sibling r2 must not be packageable, matching read")
+	}
+
+	// 授权建立后新增并生效：限定诊断不外溢，整类医嘱自然包含——
+	// 查阅与打包两条路径必须给出同一结论。
+	newDiag, _ := f.s.CreateDraft(doc, f.pid, f.e1, Diagnosis, "授权后诊断")
+	if _, err := f.s.ActivateRecord(doc, newDiag.ID); err != nil {
+		t.Fatal(err)
+	}
+	newOrder, _ := f.s.CreateDraft(doc, f.pid, f.e1, Order, "授权后医嘱")
+	if _, err := f.s.ActivateRecord(doc, newOrder.ID); err != nil {
+		t.Fatal(err)
+	}
+	diag, _ = f.s.Read(rcv, f.pid, f.e1, Diagnosis)
+	if ids := readRecordIDs(diag); ids[newDiag.ID] {
+		t.Fatalf("later diagnosis leaked into selected scope: %+v", diag.Records)
+	}
+	ord, _ = f.s.Read(rcv, f.pid, f.e1, Order)
+	if ids := readRecordIDs(ord); !ids[newOrder.ID] {
+		t.Fatalf("later order missing from whole scope: %+v", ord.Records)
+	}
+	if packagable(newDiag.ID) {
+		t.Fatal("later diagnosis must not be packageable under selected scope")
+	}
+	if !packagable(newOrder.ID) {
+		t.Fatal("later order must be packageable under whole scope")
+	}
+
+	// 覆盖关系不串到其他就诊：e2 的诊断查阅被拒，也不能由本授权打包。
+	if _, err := f.s.Read(rcv, f.pid, f.e2, Diagnosis); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("other encounter read err = %v, want ErrAccessDenied", err)
+	}
+	if packagable(f.e2rec) {
+		t.Fatal("record from another encounter must not be packageable")
+	}
+}
+
 // ---- 重开恢复：限定记录、授权状态、历史交换保留 ----
 
 func TestSelectivePersistenceAcrossReopen(t *testing.T) {
