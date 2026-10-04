@@ -397,6 +397,122 @@ func TestFetchPackageRechecksBinding(t *testing.T) {
 	}
 }
 
+// ---- 取包时刻：等待结束、真正开始核对权限的时刻 ----
+
+// fetchWhileStoreBusy 模拟取包请求发出后被同一存储上的其他操作阻塞：先占用
+// 存储互斥锁，再在阻塞期间把时钟推进到 advanceTo，随后放行取包。返回取包
+// 最终的交付与错误。
+func fetchWhileStoreBusy(f exchangeFixture, exchangeID ID, advanceTo time.Time) (PackageDelivery, error) {
+	f.s.mu.Lock()
+	type outcome struct {
+		del PackageDelivery
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		del, err := f.s.FetchPackage(rcv, exchangeID)
+		done <- outcome{del, err}
+	}()
+	// 给取包 goroutine 留出进入 FetchPackage 并阻塞在锁上的时间，确保请求
+	// 是在时钟推进之前发出的。
+	time.Sleep(50 * time.Millisecond)
+	f.clk.t = advanceTo
+	f.s.mu.Unlock()
+	o := <-done
+	return o.del, o.err
+}
+
+func assertEmptyDelivery(t *testing.T, del PackageDelivery) {
+	t.Helper()
+	if del.ExchangeID != "" || del.Status != "" || del.Digest != "" || !del.CreatedAt.IsZero() {
+		t.Fatalf("denied delivery must carry no exchange info: %+v", del)
+	}
+	if del.Package.PatientID != "" || del.Package.ReceiverID != "" || len(del.Package.Records) != 0 {
+		t.Fatalf("denied delivery must carry no package content or record ids: %+v", del.Package)
+	}
+}
+
+func TestFetchPackageJudgesBindingAtCheckTimeNotRequestTime(t *testing.T) {
+	f := setupExchange(t)
+	x, err := f.s.CreateExchange(doc, f.pid, rcv.ID, f.auth.ID, []ID{f.diag, f.ord}, "req-wait")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 交换创建后把诊断更正到 v3：成功取包仍应给出创建时固化的 v2，
+	// 等待与更正都不能让这次取包变成重新打包。
+	if _, err := f.s.CorrectRecord(doc, f.diag, 2, "诊断v3内容", "打包后的更正"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 另一条同一患者、同一接收方的授权，覆盖相同记录且在截止时刻之后仍有效：
+	// 绑定授权到期后它也不能替代。
+	otherAuth, err := f.s.Grant(doc, f.pid, rcv.ID,
+		[]Scope{{EncounterID: f.e1, Category: Diagnosis}, {EncounterID: f.e1, Category: Order}},
+		f.start.Add(-time.Hour), f.end.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = otherAuth
+
+	// 请求发出时距截止时刻还有 1ns，但等待期间恰好到达截止时刻：核对权限时
+	// 授权已失效（[StartsAt, ExpiresAt)，截止时刻不算有效），必须拒绝，
+	// 交付为空，不携带包内容、摘要、记录标识或交换状态。
+	f.clk.t = f.end.Add(-time.Nanosecond)
+	del, err := fetchWhileStoreBusy(f, x.ID, f.end)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("binding expired during wait: err = %v, want ErrAccessDenied", err)
+	}
+	assertEmptyDelivery(t, del)
+
+	// 没有等待时恰好到达截止时刻同样拒绝，时间边界不改变。
+	f.clk.t = f.end
+	if del, err := f.s.FetchPackage(rcv, x.ID); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("fetch exactly at expiry err = %v, delivery = %+v", err, del)
+	}
+
+	// 反向：请求发出时绑定授权尚未开始，等待期间进入其时间窗并在开始时刻
+	// 开始核对：开始时刻即生效，应成功取包。
+	f.clk.t = f.start.Add(-time.Minute)
+	del, err = fetchWhileStoreBusy(f, x.ID, f.start)
+	if err != nil {
+		t.Fatalf("binding started during wait must allow fetch: %v", err)
+	}
+	if del.ExchangeID != x.ID || del.Digest != x.Digest || del.Status != ExchangePending {
+		t.Fatalf("bad delivery after wait: %+v", del)
+	}
+	if len(del.Package.Records) != 2 {
+		t.Fatalf("records = %d, want 2", len(del.Package.Records))
+	}
+	for _, pr := range del.Package.Records {
+		if pr.RecordID == f.diag {
+			if pr.VersionID != f.diagV2.ID || pr.Version != 2 || pr.Content != "诊断v2内容" {
+				t.Fatalf("fetch refroze package to current version: %+v", pr)
+			}
+		}
+	}
+
+	// 核对时刻仍在截止之前（差 1ns）：即便请求早在授权尚未开始时就已发出，
+	// 也按核对时刻判断并成功。
+	f.clk.t = f.start.Add(-time.Minute)
+	del, err = fetchWhileStoreBusy(f, x.ID, f.end.Add(-time.Nanosecond))
+	if err != nil {
+		t.Fatalf("check just before expiry must allow fetch: %v", err)
+	}
+	if del.Digest != x.Digest {
+		t.Fatalf("delivery digest = %q, want %q", del.Digest, x.Digest)
+	}
+
+	// 等待期间跨过截止时刻：虽然另一条授权此时仍覆盖相同记录，也不能替代
+	// 已经到期的绑定授权。
+	f.clk.t = f.end.Add(-time.Nanosecond)
+	del, err = fetchWhileStoreBusy(f, x.ID, f.end.Add(time.Minute))
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("sibling grant must not replace expired binding: err = %v, delivery = %+v", err, del)
+	}
+	assertEmptyDelivery(t, del)
+}
+
 // ---- 回执登记 ----
 
 func TestSubmitReceiptAcceptAndReject(t *testing.T) {
