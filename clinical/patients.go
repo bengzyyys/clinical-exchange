@@ -78,8 +78,12 @@ func (s *Store) DeactivatePatient(actor Actor, patientID ID) error {
 			return err
 		}
 		if p.Deactivated {
-			// 幂等：保持已有结果，不生成额外变化或事件。
-			return nil
+			// 幂等：正式保存的患者状态已经停用。确认已有结果即可——保留首次
+			// 停用的身份、时间与事件标识，不生成额外变化或事件，也不落盘：
+			// 重复确认不依赖当前能否写入本地数据，任何内部使用者在更晚时刻
+			// 的合法确认都得到同一成功结果。是否已停用只以正式保存的状态
+			// 为准，保存失败的停用尝试不会留下痕迹，不构成本分支的依据。
+			return errUnchanged
 		}
 		now := s.now()
 		p.Deactivated = true
