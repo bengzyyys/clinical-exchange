@@ -57,10 +57,24 @@ func WithClock(c Clock) Option {
 // Open 在指定目录打开（必要时创建）本地存储。
 // 调用方指定数据存放位置；关闭后从同一位置重新打开可看到全部历史，
 // 到期与否始终按“本次读取时间”重新计算。
+//
+// 相对路径只在本次 Open 调用时按当前工作目录解释，并立即固定为绝对路径：
+// 句柄成功打开后，即使调用进程随后切换工作目录，该句柄的读取与落盘仍始终
+// 指向打开时确定的目录，既不会把数据写到新工作位置下的同名目录，也不会因
+// 新位置缺少该目录而让原本可成功的保存失败。切换工作目录后另行调用 Open
+// 时，相对路径仍按新调用时刻的工作位置重新解释。
 func Open(dir string, opts ...Option) (*Store, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("%w: empty data directory", ErrInvalidArgument)
 	}
+	// 在创建目录之前就把路径固定为绝对路径。此时路径尚不存在也没关系：
+	// Abs 只做词法解析，不访问文件系统；后续 MkdirAll 与所有读写都使用
+	// 这个固定值，与进程工作目录再无关系。
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir = absDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
