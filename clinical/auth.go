@@ -154,8 +154,11 @@ func (s *Store) GrantSelective(actor Actor, patientID ID, receiverID string, sco
 }
 
 // Revoke 提前撤回授权。撤回在当前时间生效；此后该授权不再覆盖任何读取。
-// 重复撤回返回成功且不产生额外变化（不新增审计事件），与“停用”语义一致。
-// 撤回其他患者的授权 ID 会得到 ErrMismatchedPatient/ErrNotFound。
+// 重复撤回返回成功且不产生额外变化（不新增审计事件、不改写撤回时间与操作
+// 身份），与“停用”语义一致。确认只依据正式保存的撤回结果：即使本地保存
+// 条件当前暂时不可用，合法的重复撤回也成功返回已有结果，不再尝试写盘；
+// 但授权尚未撤回时若保存失败，仍明确返回保存错误。撤回其他患者的授权 ID
+// 会得到 ErrMismatchedPatient/ErrNotFound（与授权是否已撤回无关）。
 func (s *Store) Revoke(actor Actor, patientID, authorizationID ID) error {
 	if !actor.valid() || !actor.IsInternal() {
 		return ErrAccessDenied
@@ -170,8 +173,11 @@ func (s *Store) Revoke(actor Actor, patientID, authorizationID ID) error {
 				ErrMismatchedPatient, authorizationID, a.PatientID, patientID)
 		}
 		if a.RevokedAt != nil {
-			// 幂等：保持已有撤回结果，不生成额外变化或事件。
-			return nil
+			// 幂等：正式保存的授权已经撤回。确认已有结果即可——保持首次撤回
+			// 的时间与操作身份、原接收方/范围/有效期，不生成额外变化或事件，
+			// 也不落盘：重复确认不依赖当前能否写入本地数据，任何内部使用者
+			// 的合法确认都得到同一结果，且不能把撤回时间更新到本次调用时刻。
+			return errUnchanged
 		}
 		now := s.now()
 		a.RevokedAt = &now
