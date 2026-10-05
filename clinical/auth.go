@@ -170,8 +170,10 @@ func (s *Store) Revoke(actor Actor, patientID, authorizationID ID) error {
 				ErrMismatchedPatient, authorizationID, a.PatientID, patientID)
 		}
 		if a.RevokedAt != nil {
-			// 幂等：保持已有撤回结果，不生成额外变化或事件。
-			return nil
+			// 幂等：保持已有撤回结果，不生成额外变化或事件。命中正式保存的
+			// 撤回结果时不落盘——即使本地保存条件当前不可用，重复确认也必须
+			// 成功返回，且不依赖本次能否写入。
+			return errUnchanged
 		}
 		now := s.now()
 		a.RevokedAt = &now
