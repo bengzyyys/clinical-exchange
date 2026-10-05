@@ -39,6 +39,8 @@ type Clock func() time.Time
 // Store 是本地临床档案的句柄。数据存放位置由调用方在 Open 时指定。
 // 同一目录同一时刻只允许一个 Store 打开（通过锁文件互斥）。
 type Store struct {
+	// dir 始终是成功打开时确定的绝对数据目录：即使调用进程之后切换工作
+	// 目录，句柄的查询与保存仍作用于这里，不会漂移到别处的同名目录。
 	dir   string
 	clock Clock
 	mu    sync.Mutex
@@ -57,10 +59,24 @@ func WithClock(c Clock) Option {
 // Open 在指定目录打开（必要时创建）本地存储。
 // 调用方指定数据存放位置；关闭后从同一位置重新打开可看到全部历史，
 // 到期与否始终按“本次读取时间”重新计算。
+//
+// dir 为相对路径时，它只在本次 Open 调用的时刻按调用进程的当前工作目录
+// 解析一次；解析得到的绝对目录随即固定在返回的句柄上。之后调用进程即使
+// 切换工作目录，该句柄的查询与保存也始终作用于打开成功时确定的数据目录，
+// 不会随工作目录变化而读写别处的同名目录。
 func Open(dir string, opts ...Option) (*Store, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("%w: empty data directory", ErrInvalidArgument)
 	}
+	// 在按工作目录创建任何内容之前，先把数据目录固定为绝对路径。相对路径
+	// 只按本次打开时的工作目录解释；句柄存活期间进程工作目录的变化不能
+	// 改变它所管理的数据目录（否则后续保存可能落到新工作目录下的同名
+	// 目录，甚至在那里凭空创建另一份档案）。
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir = absDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
