@@ -17,6 +17,7 @@ go test ./...
 - **授权与接收方读取**：`Grant` 建立整类授权，范围由明确的“就诊 + 诊断/医嘱类别”组成；`GrantSelective` 还可在该就诊的诊断或医嘱中明确选出若干条**已生效记录**（`RecordSelection`）。同一条授权可包含多个就诊、类别，整类范围与选定记录范围可以并存；重复选择同一记录只算一次。被选记录更正后授权覆盖它的当前版本，但同一就诊同类的其他记录以及后来新增、生效的记录都不会自动进入限定范围。授权带 `[开始, 截止)` 时间窗；空范围、空选择、空白标识、跨患者、选择草稿或记录与声明的就诊/类别不符均拒绝（空选择不会被当成整类授权），任一选择不合法就拒绝整条授权。接收方 `Read` 只能看到所有当前有效授权允许记录的合集（每条只出现一次、按稳定顺序），看不到草稿、旧版本或更正原因；未开始、已到期、已撤回或无授权一律返回 `ErrAccessDenied`，不泄露未授权记录的标识、数量或内容。整类与限定重叠时可见整类内容；撤回整类授权后只剩其他有效授权明确允许的记录。多授权独立判断，撤回互不影响；可 `Revoke` 提前撤回。内部使用者可用 `ListAuthorizations` 按患者（可再按接收方）列出该患者已保存的**全部**授权（含尚未开始、已到期、已撤回者，按授权标识升序）；清单只是历史视图，列出一条授权不代表接收方此刻能读取临床内容，接收方身份不可调用。
 - **打包交换与回执**：内部使用者 `CreateExchange` 指定患者、接收方、一条当前有效授权、已生效记录集合与非空请求号，把记录的**创建时当前版本**固化成包并计算摘要，状态为待回执。所选每条记录都必须被**绑定的那一条授权**自身覆盖（整类或选定记录），不能借用同一接收方的其他授权补足；记录跨患者、夹带草稿、夹带一条不被绑定授权覆盖的记录、授权不符、患者停用一律拒绝，不留交换或审计，也不占用请求号。请求号按内部使用者区分：相同请求号与相同参数（集合顺序无关）重试返回原交换及现有状态，不重新取内容或新增审计；其他参数变化返回 `ErrConflict`。接收方 `FetchPackage` 按等待结束、真正开始核对本次取包权限的时刻重新检查绑定授权与患者状态（提前发出的请求不会延长授权有效期；其他有效授权不能替代），`SubmitReceipt` 凭摘要登记接受/拒绝回执；授权失效或患者停用后取包被拒，但此前包的回执仍可登记，且只返回确认状态。内部使用者可用 `GetExchange`/`ListExchanges` 按患者查看原包与回执，停用后亦可。
 - **停用**：停用后不能新增就诊、改草稿、生效、更正、新建授权，接收方也不能继续读取或取包；但接收方对停用前已取得的包仍可登记回执，内部使用者仍能查看完整历史。重复停用/撤回幂等，不产生额外变化。
+- **内部完整视图**：内部使用者可用 `EncounterRecords` 查看某次就诊下的全部记录——草稿正文、当前生效版本，以及从首版到最新版的完整版本链（含每次更正的原文与原因）；患者停用后仍可查看。接收方不能调用，详见下文专节。
 - **审计**：生效、更正、授权创建与撤回、档案停用、交换创建与首次回执登记均记录操作身份、时间、对象与动作，仅供内部使用者按患者查看。
 - 成功的业务变更与其审计事件在同一次原子写盘中保留；失败操作不改变任何已有状态。
 
@@ -803,6 +804,284 @@ func die(format string, args ...any) {
 
 本次只补齐 `ListAuthorizations` 的使用说明与示例：授权建立、撤回、接收方
 读取、交换与回执等已有公开行为与示例均保持不变。
+
+## 内部使用者查看一次就诊的完整记录历史
+
+更正会保留旧版本，但接收方的 `Read` 只返回当前生效版本——旧版本原文与每次
+更正的原因只有**内部使用者**能取得。`EncounterRecords(actor, patientID,
+encounterID)` 就是这条查询路径：它返回该次就诊下全部记录的
+`[]RecordHistory`，每项把一条记录的三种形态分开放置，读者可以据此区分尚未
+生效的草稿、当前生效内容和完整版本历史：
+
+- **草稿**：`HasDraft` 为 `true` 时，`DraftContent` 是当前草稿正文。草稿
+  尚未生效，因此 `CurrentVersion` 为 `nil`、`Versions` 为空——草稿不会被
+  表现成任何生效版本。
+- **当前生效内容**：记录生效后，`CurrentVersion` 指向当前生效版本
+  （`*Version`），含版本号 `Number` 与完整正文 `Content`。
+- **完整版本历史**：`Versions` 按版本号**旧到新**列出从第一个生效版本到
+  最新版的全部版本。每个版本带自己的标识 `ID`、版本号 `Number`、上一版本
+  标识 `PrevID` 与更正原因 `Reason`：**首版（第 1 版）由生效产生，
+  `PrevID` 与 `Reason` 均为空**；此后每次更正产生的新版本，`PrevID` 指向
+  紧邻的上一版，`Reason` 是该次更正提交的原因。当前版本同时就是
+  `Versions` 中的最新一版（`CurrentVersion.ID` 等于末位版本的 `ID`），
+  不是历史之外额外发生的一次更正。
+- **记录列表的顺序**：返回的记录列表按**记录标识**的字符串顺序升序排列，
+  不是按录入时间排序——先录入的记录可能排在后面，不要把列表位置解释成
+  录入先后；要对应到具体记录，应按 `Record.ID` 定位。版本历史则始终按
+  版本号旧到新排列。
+
+使用边界（与这项查询直接相关）：
+
+- **患者停用后仍可查询**：停用不清空、不拒绝此查询，原有草稿与完整历史
+  （含各版正文与更正原因）照常返回。
+- **接收方一律不能调用**：即使接收方持有覆盖该就诊该类别的当前有效授权，
+  调用 `EncounterRecords` 也返回 `ErrAccessDenied`，结果不携带任何记录
+  ——草稿、旧版本与更正原因不对接收方开放。
+- **引用不存在的对象**：患者或就诊不存在（或不属于该患者）返回
+  `ErrNotFound`，不带回任何条目。
+
+下面的完整示例位于
+[`examples/encounter_records`](examples/encounter_records/main.go)
+（`go run ./examples/encounter_records`）。它独立准备本地存储、内部使用者、
+一名合成患者与一次就诊，在该就诊中保留一条医嘱草稿，并准备一条已生效、经过
+两次更正的诊断（两次更正使用不同的正文和原因，各以当时的当前版本号提交）；
+随后由内部使用者查询这次就诊，输出明确对应到这两条记录，并演示接收方调用被
+拒、患者停用后查询内容保持原样。示例对每一步业务调用都检查错误：准备资料或
+查询失败时由 `must` 明确指出失败发生在哪一步并终止，不继续使用失败的返回值：
+
+```go
+// 命令 encounter_records 演示内部使用者如何用 EncounterRecords 查看一次就诊的
+// 完整记录历史：同一次就诊中保留一条医嘱草稿，并准备一条已生效、经过两次更正的
+// 诊断。内部使用者查询这次就诊后，输出明确对应到这两条记录：
+//
+//   - 医嘱草稿：展示草稿标记与当前草稿正文，并明确它没有当前生效版本、也没有
+//     任何历史版本；
+//   - 诊断：展示当前版本号与当前正文，以及从第一个生效版本到两次更正后的全部
+//     历史——每个版本的标识、版本号、上一版本标识与更正原因一一对应；首版没有
+//     上一版本和更正原因，后续版本各自指向紧邻的上一版；当前版本就是完整历史
+//     中的最新一版，不是额外发生的一次更正。
+//
+// 同时演示两条使用边界：患者停用后内部使用者仍能取得原有草稿与完整历史；接收方
+// 即使持有覆盖该就诊的临床内容授权，也不能调用这个内部查询（ErrAccessDenied，
+// 结果不携带任何记录）。
+//
+// 全程只使用合成患者资料。运行：
+//
+//	go run ./examples/encounter_records
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/bengzyyys/clinical-exchange/clinical"
+)
+
+// 诊断三个版本的正文与两次更正的原因：两次更正使用不同的正文和原因。
+const (
+	diagV1Content = "合成诊断：高血压 I10（初诊记录）"
+	diagV2Content = "合成诊断：高血压 I10（补录当日血压测量值）"
+	diagV3Content = "合成诊断：原发性高血压 I10（复核确认）"
+	diagV2Reason  = "第一次更正：补录当日血压测量值"
+	diagV3Reason  = "第二次更正：复核后明确诊断名称"
+
+	orderDraftContent = "合成医嘱草稿：待确认的检查项目"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "clinical-encounter-records-")
+	must("创建临时数据目录", err)
+	defer os.RemoveAll(dir)
+
+	store, err := clinical.Open(dir)
+	must("打开本地存储", err)
+	defer store.Close()
+
+	doctor := clinical.InternalActor("doctor-1")
+	receiver := clinical.ReceiverActor("insurer-1")
+
+	// ---- 准备资料：合成患者、一次就诊、一条经两次更正的诊断、一条医嘱草稿 ----
+	patient, err := store.RegisterPatient(doctor, "合成患者辛")
+	must("登记合成患者", err)
+	encounter, err := store.AddEncounter(doctor, patient.ID, time.Now())
+	must("登记就诊", err)
+
+	diag, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, diagV1Content)
+	must("创建诊断草稿", err)
+	v1, err := store.ActivateRecord(doctor, diag.ID)
+	must("生效诊断（第 1 版）", err)
+	// 两次更正都以当时的当前版本号提交：第一次提交第 1 版生效时的版本号，
+	// 第二次提交第一次更正产生的新版本号；两次的正文与更正原因各不相同。
+	v2, err := store.CorrectRecord(doctor, diag.ID, v1.Number, diagV2Content, diagV2Reason)
+	must("第一次更正诊断", err)
+	v3, err := store.CorrectRecord(doctor, diag.ID, v2.Number, diagV3Content, diagV3Reason)
+	must("第二次更正诊断", err)
+
+	orderDraft, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Order, orderDraftContent)
+	must("创建医嘱草稿（保持草稿状态）", err)
+
+	// 接收方持有覆盖该次就诊诊断的有效授权——用于演示即使有临床内容授权，
+	// 也不能调用这个内部查询。
+	now := time.Now()
+	_, err = store.Grant(doctor, patient.ID, receiver.ID,
+		[]clinical.Scope{{EncounterID: encounter.ID, Category: clinical.Diagnosis}},
+		now, now.Add(24*time.Hour))
+	must("为接收方建立诊断授权", err)
+	fmt.Println("准备完成: 一次就诊下有一条经两次更正的已生效诊断和一条保持草稿状态的医嘱")
+
+	// ---- 内部使用者查询这次就诊，输出明确对应到两条记录 ----
+	rows := queryEncounter(store, doctor, patient.ID, encounter.ID, "停用前查询")
+
+	// 记录列表按记录标识升序排列，与录入先后无关：先录入的是诊断，但它在
+	// 列表中的位置由随机生成的记录标识决定，不能把列表顺序当作录入时间顺序。
+	fmt.Printf("记录列表按记录标识升序排列=%v（先录入诊断、后录入医嘱草稿，列表顺序不表示录入先后）\n",
+		idsAscending(rows))
+
+	// 按记录标识定位两条记录，而不是依赖列表位置。
+	byID := map[clinical.ID]clinical.RecordHistory{}
+	for _, h := range rows {
+		byID[h.Record.ID] = h
+	}
+
+	// 医嘱草稿：草稿标记与当前草稿正文都在；没有当前生效版本，也没有历史版本。
+	d := byID[orderDraft.ID]
+	draftShape := d.HasDraft && d.DraftContent == orderDraftContent &&
+		d.CurrentVersion == nil && len(d.Versions) == 0 &&
+		d.Record.CurrentVersionID == "" && len(d.Record.Versions) == 0
+	fmt.Printf("医嘱草稿: HasDraft=%v，当前草稿正文=%q；无当前生效版本且无历史版本=%v\n",
+		d.HasDraft, d.DraftContent, draftShape)
+
+	// 诊断：当前版本号与当前正文。
+	h := byID[diag.ID]
+	currentOK := h.CurrentVersion != nil && h.CurrentVersion.ID == v3.ID &&
+		h.CurrentVersion.Number == 3 && h.CurrentVersion.Content == diagV3Content
+	fmt.Printf("诊断当前版本: 版本号=%d，当前正文=%q（即第二次更正的结果=%v）\n",
+		h.CurrentVersion.Number, h.CurrentVersion.Content, currentOK)
+
+	// 诊断：从第一个生效版本到两次更正后的完整历史，按版本号旧到新。
+	fmt.Println("诊断完整历史（按版本号旧到新）:")
+	for _, v := range h.Versions {
+		fmt.Printf("  第 %d 版: 版本标识=%s，上一版本标识=%q，更正原因=%q，正文=%q\n",
+			v.Number, v.ID, v.PrevID, v.Reason, v.Content)
+	}
+	chainOK := len(h.Versions) == 3 &&
+		h.Versions[0].ID == v1.ID && h.Versions[0].Number == 1 &&
+		h.Versions[0].PrevID == "" && h.Versions[0].Reason == "" &&
+		h.Versions[1].ID == v2.ID && h.Versions[1].Number == 2 &&
+		h.Versions[1].PrevID == v1.ID && h.Versions[1].Reason == diagV2Reason &&
+		h.Versions[2].ID == v3.ID && h.Versions[2].Number == 3 &&
+		h.Versions[2].PrevID == v2.ID && h.Versions[2].Reason == diagV3Reason
+	fmt.Printf("版本链核对: 首版无上一版本与更正原因，第 2、3 版各自指向紧邻的上一版并保留各自原因=%v\n",
+		chainOK)
+	currentIsLatest := h.CurrentVersion.ID == h.Versions[len(h.Versions)-1].ID
+	fmt.Printf("当前版本即完整历史中的最新一版（不是额外发生的一次更正）=%v\n", currentIsLatest)
+
+	// ---- 边界一：接收方即使持有临床内容授权，也不能调用这个内部查询 ----
+	denied, err := store.EncounterRecords(receiver, patient.ID, encounter.ID)
+	if !errors.Is(err, clinical.ErrAccessDenied) || denied != nil {
+		die("接收方调用内部查询应返回 ErrAccessDenied 且不携带记录，实际得到 err=%v、%d 条",
+			err, len(denied))
+	}
+	fmt.Printf("持有有效授权的接收方调用内部查询: 被拒绝（%v），结果不携带任何记录\n",
+		clinical.ErrAccessDenied)
+
+	// ---- 边界二：患者停用后，内部使用者仍能取得原有草稿与完整历史 ----
+	must("停用患者", store.DeactivatePatient(doctor, patient.ID))
+	after := queryEncounter(store, doctor, patient.ID, encounter.ID, "停用后查询")
+
+	afterByID := map[clinical.ID]clinical.RecordHistory{}
+	for _, h := range after {
+		afterByID[h.Record.ID] = h
+	}
+	ad := afterByID[orderDraft.ID]
+	ah := afterByID[diag.ID]
+	preserved := len(after) == 2 &&
+		ad.HasDraft && ad.DraftContent == orderDraftContent &&
+		ad.CurrentVersion == nil && len(ad.Versions) == 0 &&
+		ah.CurrentVersion != nil && ah.CurrentVersion.Number == 3 &&
+		ah.CurrentVersion.Content == diagV3Content &&
+		len(ah.Versions) == 3 &&
+		ah.Versions[0].PrevID == "" && ah.Versions[0].Reason == "" &&
+		ah.Versions[1].PrevID == ah.Versions[0].ID && ah.Versions[1].Reason == diagV2Reason &&
+		ah.Versions[2].PrevID == ah.Versions[1].ID && ah.Versions[2].Reason == diagV3Reason
+	fmt.Printf("停用后查询: 记录数=%d，原有草稿与完整历史（含各版正文与更正原因）保持原样=%v\n",
+		len(after), preserved)
+}
+
+// queryEncounter 执行一次就诊记录查询并打印结果条数；查询失败时明确提示并
+// 终止，不继续使用失败的返回值。
+func queryEncounter(store *clinical.Store, actor clinical.Actor,
+	patientID, encounterID clinical.ID, title string,
+) []clinical.RecordHistory {
+	rows, err := store.EncounterRecords(actor, patientID, encounterID)
+	must(title, err)
+	fmt.Printf("%s: 成功，记录数=%d\n", title, len(rows))
+	return rows
+}
+
+func idsAscending(rows []clinical.RecordHistory) bool {
+	for i := 1; i < len(rows); i++ {
+		if rows[i-1].Record.ID >= rows[i].Record.ID {
+			return false
+		}
+	}
+	return true
+}
+
+func must(step string, err error) {
+	if err != nil {
+		die("%s失败: %v", step, err)
+	}
+}
+
+func die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "example: "+format+"\n", args...)
+	os.Exit(1)
+}
+```
+
+结果说明（对照输出；记录与版本标识由存储随机生成，每次运行的具体标识不同，
+但版本之间的指向关系与各项核对结论不变）：
+
+```text
+准备完成: 一次就诊下有一条经两次更正的已生效诊断和一条保持草稿状态的医嘱
+停用前查询: 成功，记录数=2
+记录列表按记录标识升序排列=true（先录入诊断、后录入医嘱草稿，列表顺序不表示录入先后）
+医嘱草稿: HasDraft=true，当前草稿正文="合成医嘱草稿：待确认的检查项目"；无当前生效版本且无历史版本=true
+诊断当前版本: 版本号=3，当前正文="合成诊断：原发性高血压 I10（复核确认）"（即第二次更正的结果=true）
+诊断完整历史（按版本号旧到新）:
+  第 1 版: 版本标识=ver_182ae682ccfdcff76208539c，上一版本标识=""，更正原因=""，正文="合成诊断：高血压 I10（初诊记录）"
+  第 2 版: 版本标识=ver_75ee5ac7011448170e662608，上一版本标识="ver_182ae682ccfdcff76208539c"，更正原因="第一次更正：补录当日血压测量值"，正文="合成诊断：高血压 I10（补录当日血压测量值）"
+  第 3 版: 版本标识=ver_c2d90109e0a5020239bc5ea8，上一版本标识="ver_75ee5ac7011448170e662608"，更正原因="第二次更正：复核后明确诊断名称"，正文="合成诊断：原发性高血压 I10（复核确认）"
+版本链核对: 首版无上一版本与更正原因，第 2、3 版各自指向紧邻的上一版并保留各自原因=true
+当前版本即完整历史中的最新一版（不是额外发生的一次更正）=true
+持有有效授权的接收方调用内部查询: 被拒绝（clinical: access denied），结果不携带任何记录
+停用后查询: 成功，记录数=2
+停用后查询: 记录数=2，原有草稿与完整历史（含各版正文与更正原因）保持原样=true
+```
+
+- **两种形态一眼可分**：医嘱草稿只有 `HasDraft=true` 与当前草稿正文，没有
+  当前生效版本、没有任何历史版本；诊断则展示当前版本号（第 3 版）与当前
+  正文，另起完整历史。读者据此区分“尚未生效的草稿”“当前生效内容”与
+  “完整版本历史”。
+- **版本链可逐环核对**：第 1 版的上一版本标识与更正原因均为空（生效产生
+  的首版没有上一版）；第 2 版的上一版本标识等于第 1 版的版本标识，第 3 版
+  的上一版本标识等于第 2 版的版本标识，两版各自保留不同的更正原因。当前
+  版本（第 3 版）就是历史列表中的最新一版，不是额外发生的一次更正。
+- **列表顺序不表示录入先后**：先录入诊断、后录入医嘱草稿，但记录列表按
+  记录标识升序排列；示例按记录标识定位两条记录，而不是依赖列表位置。
+- **接收方被拒**：insurer-1 持有覆盖该就诊诊断的当前有效授权，调用
+  `EncounterRecords` 仍得到 `ErrAccessDenied`，结果不携带任何记录——
+  草稿、旧版本与更正原因只对内部使用者开放。
+- **停用后内容保持原样**：患者停用后内部使用者再次查询，仍返回 2 条记录，
+  草稿正文与三个版本的正文、版本链、更正原因与停用前一致。
+
+本次只补齐 `EncounterRecords` 的使用说明与示例：草稿、生效、更正、授权、
+接收方读取等已有公开行为与权限规则均保持不变。
 
 ## 取包被拒后仍可登记回执
 
