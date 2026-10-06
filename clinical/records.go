@@ -3,7 +3,18 @@ package clinical
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
+
+// validContent 校验诊断/医嘱正文：非空白且必须是完整合法的 UTF-8。
+// 本地快照以 JSON 落盘，encoding/json 会把无效 UTF-8 字节静默替换为
+// U+FFFD——若放行，当次查询看到的是原字节而重开后正文已被改写。因此
+// 夹带不完整多字节字符、孤立续字节等任何无效序列的正文一律拒绝，
+// 绝不靠替换、截断或跳过坏字节继续保存。用户明确输入的合法 U+FFFD
+// 字符本身是合法 UTF-8，不受此限制。
+func validContent(content string) bool {
+	return utf8.ValidString(content)
+}
 
 // CreateDraft 在某次就诊下新建一条诊断或医嘱草稿。
 // 患者必须存在且未停用；就诊必须属于该患者（否则 ErrMismatchedPatient）；
@@ -20,6 +31,9 @@ func (s *Store) CreateDraft(actor Actor, patientID, encounterID ID, category, co
 	}
 	if strings.TrimSpace(content) == "" {
 		return Record{}, fmt.Errorf("%w: draft content is required", ErrInvalidArgument)
+	}
+	if !validContent(content) {
+		return Record{}, fmt.Errorf("%w: draft content must be valid UTF-8", ErrInvalidArgument)
 	}
 
 	var result Record
@@ -53,6 +67,9 @@ func (s *Store) UpdateDraft(actor Actor, recordID ID, content string) (Record, e
 	}
 	if strings.TrimSpace(content) == "" {
 		return Record{}, fmt.Errorf("%w: draft content is required", ErrInvalidArgument)
+	}
+	if !validContent(content) {
+		return Record{}, fmt.Errorf("%w: draft content must be valid UTF-8", ErrInvalidArgument)
 	}
 
 	var result Record
@@ -138,6 +155,9 @@ func (s *Store) CorrectRecord(actor Actor, recordID ID, expectedCurrentVersion i
 	}
 	if strings.TrimSpace(content) == "" {
 		return Version{}, fmt.Errorf("%w: corrected content is required", ErrInvalidArgument)
+	}
+	if !validContent(content) {
+		return Version{}, fmt.Errorf("%w: corrected content must be valid UTF-8", ErrInvalidArgument)
 	}
 	if strings.TrimSpace(reason) == "" {
 		return Version{}, fmt.Errorf("%w: correction reason is required", ErrInvalidArgument)
