@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Grant 由内部使用者为一名接收方建立针对某患者的整类读取授权。
@@ -32,7 +33,8 @@ func (s *Store) Grant(actor Actor, patientID ID, receiverID string, scopes []Sco
 // scopes 与 selections 不能同时为空：空选择不代表整类授权。scope 中的
 // 就诊必须存在且属于该患者，类别必须合法。每条 selection 都必须显式
 // 声明记录所属的就诊与类别，且：记录不存在返回 ErrNotFound；记录属于
-// 其他患者返回 ErrMismatchedPatient；空选择、空白标识、选择了尚未生效
+// 其他患者返回 ErrMismatchedPatient；空选择、空白或含无效 UTF-8 字节的
+// 接收方标识、选择了尚未生效
 // 的草稿、记录与声明的就诊或类别不符返回 ErrInvalidArgument。任一选择
 // 不合法就拒绝整条授权：不保存合法部分，也不新增审计。
 //
@@ -46,6 +48,15 @@ func (s *Store) GrantSelective(actor Actor, patientID ID, receiverID string, sco
 	}
 	if strings.TrimSpace(receiverID) == "" {
 		return Authorization{}, fmt.Errorf("%w: receiver id is required", ErrInvalidArgument)
+	}
+	// 接收方标识必须是完整合法的 UTF-8：本地快照以 JSON 落盘，encoding/json
+	// 会把无效字节静默替换为 U+FFFD——若放行，重开后保存的标识与授权当次
+	// 返回的不同，授权会归到使用替换后标识的另一接收方名下。因此夹带任何
+	// 无效字节或不完整多字节字符的标识一律拒绝，绝不靠替换、截断或跳过坏
+	// 字节继续授权；用户明确输入的合法 U+FFFD 字符本身是合法 UTF-8，不受
+	// 此限制。
+	if !utf8.ValidString(receiverID) {
+		return Authorization{}, fmt.Errorf("%w: receiver id must be valid UTF-8", ErrInvalidArgument)
 	}
 	if len(scopes) == 0 && len(selections) == 0 {
 		return Authorization{}, fmt.Errorf("%w: authorization scope must not be empty", ErrInvalidArgument)
