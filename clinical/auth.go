@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Grant 由内部使用者为一名接收方建立针对某患者的整类读取授权。
@@ -12,7 +13,10 @@ import (
 // 这是 [Store.GrantSelective] 的整类形式：范围由明确的“就诊 + 类别
 // （诊断/医嘱）”组合构成，覆盖各就诊+类别下的全部已生效记录（含授权
 // 建立后才生效的记录）。不允许空范围，每个就诊都必须属于该患者
-// （跨患者就诊会被拒绝），类别必须合法。时间窗为半开区间
+// （跨患者就诊会被拒绝），类别必须合法。接收方标识不能为空白，且必须是
+// 完整合法的 UTF-8：夹带无效字节（孤立续字节、截断的多字节字符等）的标识
+// 一律返回 ErrInvalidArgument，不会替换、截断或跳过坏字节后继续授权；用户
+// 明确输入的合法 U+FFFD 字符不受影响。时间窗为半开区间
 // [startsAt, expiresAt)：开始时刻即生效，到截止时刻立即失效；
 // 开始不早于截止时间（相等也算）一律拒绝。患者档案停用后不能新建授权。
 // 授权与审计事件在同一次原子落盘中保留。
@@ -32,7 +36,8 @@ func (s *Store) Grant(actor Actor, patientID ID, receiverID string, scopes []Sco
 // scopes 与 selections 不能同时为空：空选择不代表整类授权。scope 中的
 // 就诊必须存在且属于该患者，类别必须合法。每条 selection 都必须显式
 // 声明记录所属的就诊与类别，且：记录不存在返回 ErrNotFound；记录属于
-// 其他患者返回 ErrMismatchedPatient；空选择、空白标识、选择了尚未生效
+// 其他患者返回 ErrMismatchedPatient；空选择、空白或含无效 UTF-8 字节的
+// 接收方标识、空白记录标识、选择了尚未生效
 // 的草稿、记录与声明的就诊或类别不符返回 ErrInvalidArgument。任一选择
 // 不合法就拒绝整条授权：不保存合法部分，也不新增审计。
 //
@@ -46,6 +51,15 @@ func (s *Store) GrantSelective(actor Actor, patientID ID, receiverID string, sco
 	}
 	if strings.TrimSpace(receiverID) == "" {
 		return Authorization{}, fmt.Errorf("%w: receiver id is required", ErrInvalidArgument)
+	}
+	// 接收方标识必须是完整合法的 UTF-8：本地快照以 JSON 落盘，encoding/json
+	// 会把无效字节静默替换为 U+FFFD——若放行，重开后保存的标识与创建时不同，
+	// 授权会被归到使用替换后标识的另一接收方名下，还可能与明确含合法 U+FFFD
+	// 的标识撞成同一个。因此夹带任何无效字节（孤立续字节、截断的多字节字符
+	// 等）的标识一律拒绝，绝不靠替换、截断或跳过坏字节继续授权；用户明确输入
+	// 的合法 U+FFFD 字符本身是合法 UTF-8，不受此限制。
+	if !utf8.ValidString(receiverID) {
+		return Authorization{}, fmt.Errorf("%w: receiver id must be valid UTF-8", ErrInvalidArgument)
 	}
 	if len(scopes) == 0 && len(selections) == 0 {
 		return Authorization{}, fmt.Errorf("%w: authorization scope must not be empty", ErrInvalidArgument)
