@@ -61,6 +61,257 @@ func main() {
 }
 ```
 
+## 只共享指定诊断：限定记录授权
+
+最小示例中的 `Grant` 是**整类授权**：一旦授权某次就诊的诊断类别，该就诊
+下的全部已生效诊断（含授权后才生效的）都对接收方可见。只需要共享其中
+**某一条**诊断时，使用 `GrantSelective` 的限定记录范围：
+
+- **整类范围留空，只列限定选择**：`scopes` 传 `nil`，用 `selections`
+  明确选出记录。每项 `RecordSelection` 必须同时填三个字段：记录标识
+  `RecordID`、记录所属就诊 `EncounterID`、记录类别 `Category`
+  （`clinical.Diagnosis` 或 `clinical.Order`），三者必须与实际一致。
+- **只能选已生效记录**：建立授权时记录必须存在、属于该患者且已生效；
+  选择草稿、空白标识、记录与声明的就诊/类别不符返回 `ErrInvalidArgument`
+  （记录不存在返回 `ErrNotFound`，跨患者返回 `ErrMismatchedPatient`）。
+- **时间窗覆盖读取时刻**：与 `Grant` 相同的半开区间
+  `[startsAt, expiresAt)`，读取时刻落在窗外（未开始或已到期）等同于
+  没有授权。
+- **接收方读到的是哪条记录、哪个版本**：`Read` 返回的每条
+  `EffectiveRecord` 含 `RecordID`、`VersionID`、`Version`（版本号）、
+  `Content` 与 `EffectiveAt`，接收方可以明确核对读到的是哪条记录的第
+  几版；结果中只有当前生效版本，不含草稿、旧版本或更正原因。
+- **选中的是记录，不是某个固定版本**：被选中记录更正后，读取自动跟随到
+  它的当前版本（新版本号、新正文），旧版本与更正原因仍不向接收方提供；
+  但同一就诊同类的其他记录、以及授权后新增并生效的记录，都不会自动进入
+  这条限定授权。
+- **限定授权不是对其他授权的缩减**：读取结果是该接收方**所有当前有效
+  授权**允许记录的合集。若同一接收方另有一条覆盖该范围的有效整类授权，
+  读取会合并两条授权允许的记录，重叠的记录只出现一次——限定授权只增加
+  明确允许的记录，不会削减其他授权本来允许的内容。下面的示例中接收方
+  只持有这一条限定授权，因此只能看到被选中的那一条。
+- **失败是整体的**：任一选择不合法就拒绝整条授权——不保存合法部分、
+  不新增授权创建审计，此前允许读取的内容保持原样。整类范围与限定选择
+  **同时为空**同样返回 `ErrInvalidArgument`：空选择不表示共享全部诊断。
+- **读取被拒**：没有任何覆盖所请求范围的有效授权（未开始、已到期、
+  已撤回或根本没有授权），或患者档案已停用，`Read` 返回
+  `ErrAccessDenied`，结果中不含任何记录的标识、数量或内容。
+
+下面的完整示例位于
+[`examples/selective_grant`](examples/selective_grant/main.go)
+（`go run ./examples/selective_grant`）。它独立准备本地存储、内部使用者、
+接收方、合成患者与就诊，在同一次就诊中准备两条已生效诊断和一条诊断草稿，
+用 `GrantSelective` 只授权第一条生效诊断，演示接收方读取、更正后跟随新
+版本、授权后新增记录不自动进入，以及两种建立授权的失败。示例对每一步
+业务调用都检查错误：准备资料或授权失败时由 `must` 明确失败发生在哪一步
+并终止，不继续把失败返回值当作正式记录或正式授权使用：
+
+```go
+// 命令 selective_grant 演示“只共享指定诊断”的限定记录授权：同一次就诊中
+// 准备两条已生效诊断和一条诊断草稿，内部使用者用 GrantSelective 只把第一条
+// 已生效诊断授权给接收方（整类范围留空）。接收方读取该次就诊的诊断时只能
+// 看到这一条；更正被选中诊断后读到新版本号与新正文，旧版本与更正原因不向
+// 接收方提供；授权后新增并生效的同类记录不自动进入这条授权。随后演示两种
+// 建立授权的失败：限定选择夹带草稿、整类范围与限定选择同时为空，二者都被
+// 整体拒绝，不保留合法部分，也不新增授权创建审计。
+//
+// 全程只使用合成患者资料。运行：
+//
+//	go run ./examples/selective_grant
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/bengzyyys/clinical-exchange/clinical"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "clinical-selective-")
+	must("创建临时数据目录", err)
+	defer os.RemoveAll(dir)
+
+	store, err := clinical.Open(dir)
+	must("打开本地存储", err)
+	defer store.Close()
+
+	doctor := clinical.InternalActor("doctor-1")
+	receiver := clinical.ReceiverActor("insurer-1")
+	stranger := clinical.ReceiverActor("insurer-2")
+
+	// ---- 准备资料：合成患者、一次就诊、两条已生效诊断与一条诊断草稿 ----
+	patient, err := store.RegisterPatient(doctor, "合成患者丁")
+	must("登记合成患者", err)
+	encounter, err := store.AddEncounter(doctor, patient.ID, time.Now())
+	must("登记就诊", err)
+
+	diag1, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, "合成诊断一：高血压 I10")
+	must("创建第一条诊断草稿", err)
+	v1, err := store.ActivateRecord(doctor, diag1.ID)
+	must("生效第一条诊断", err)
+
+	diag2, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, "合成诊断二：2 型糖尿病 E11")
+	must("创建第二条诊断草稿", err)
+	_, err = store.ActivateRecord(doctor, diag2.ID)
+	must("生效第二条诊断", err)
+
+	draft, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, "合成诊断草稿：内容待补充")
+	must("创建诊断草稿（保持草稿状态）", err)
+	fmt.Println("准备完成: 同一次就诊有两条已生效诊断和一条诊断草稿")
+
+	// ---- 建立限定授权：整类范围留空，只选第一条已生效诊断 ----
+	// 选择中明确填写记录标识及其所属就诊和类别；时间窗 [now, now+24h)
+	// 覆盖下面的读取时刻。
+	now := time.Now()
+	grant, err := store.GrantSelective(doctor, patient.ID, receiver.ID,
+		nil, // 整类范围留空：不共享该就诊下的全部诊断
+		[]clinical.RecordSelection{{
+			EncounterID: encounter.ID,       // 记录所属就诊
+			Category:    clinical.Diagnosis, // 记录类别
+			RecordID:    diag1.ID,           // 选中的记录标识
+		}},
+		now, now.Add(24*time.Hour))
+	must("建立限定授权", err)
+	fmt.Printf("建立限定授权: 成功，整类范围 %d 项，限定选择 %d 条\n",
+		len(grant.Scopes), len(grant.Selections))
+
+	// ---- 接收方读取：只得到第一条诊断的当前生效内容 ----
+	res, err := store.Read(receiver, patient.ID, encounter.ID, clinical.Diagnosis)
+	must("接收方首次读取", err)
+	onlyFirst := len(res.Records) == 1 &&
+		res.Records[0].RecordID == diag1.ID &&
+		res.Records[0].Version == v1.Number &&
+		res.Records[0].Content == "合成诊断一：高血压 I10"
+	fmt.Printf("接收方首次读取: 记录数=%d，只含被选中的第一条（版本=%d）=%v，第二条与草稿均不出现\n",
+		len(res.Records), res.Records[0].Version, onlyFirst)
+
+	// 没有任何授权的其他接收方读取同一范围：ErrAccessDenied，结果为空。
+	if _, err := store.Read(stranger, patient.ID, encounter.ID, clinical.Diagnosis); !errors.Is(err, clinical.ErrAccessDenied) {
+		die("无授权接收方读取应返回 ErrAccessDenied，实际得到 %v", err)
+	}
+	fmt.Printf("无授权接收方读取: 被拒绝（%v），不泄露任何记录\n", clinical.ErrAccessDenied)
+
+	// ---- 更正被选中的诊断：授权选中的是记录，读取跟随到它的当前版本 ----
+	v2, err := store.CorrectRecord(doctor, diag1.ID, v1.Number,
+		"合成诊断一：高血压 I10（复核确认）", "补录复核依据")
+	must("更正被选中的诊断", err)
+
+	res, err = store.Read(receiver, patient.ID, encounter.ID, clinical.Diagnosis)
+	must("更正后读取", err)
+	updated := len(res.Records) == 1 &&
+		res.Records[0].RecordID == diag1.ID &&
+		res.Records[0].Version == v2.Number &&
+		res.Records[0].Content == "合成诊断一：高血压 I10（复核确认）"
+	fmt.Printf("更正后读取: 仍为 1 条，展示新版本号=%d 与新正文=%v；旧版本与更正原因不在读取结果中\n",
+		res.Records[0].Version, updated)
+
+	// ---- 授权后新增并生效的同类记录不自动进入这条限定授权 ----
+	diag3, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, "合成诊断三：高脂血症 E78.5")
+	must("创建第三条诊断草稿", err)
+	_, err = store.ActivateRecord(doctor, diag3.ID)
+	must("生效第三条诊断", err)
+
+	res, err = store.Read(receiver, patient.ID, encounter.ID, clinical.Diagnosis)
+	must("新增诊断后读取", err)
+	stillOnlyFirst := len(res.Records) == 1 && res.Records[0].RecordID == diag1.ID
+	fmt.Printf("授权后新增并生效一条诊断: 读取记录数=%d，仍只有第一条=%v（新记录不自动进入限定授权）\n",
+		len(res.Records), stillOnlyFirst)
+
+	// ---- 失败演示一：限定选择夹带草稿，整条授权不成立 ----
+	auditsBefore, err := store.AuditEvents(doctor, patient.ID)
+	must("查看审计", err)
+
+	_, err = store.GrantSelective(doctor, patient.ID, receiver.ID, nil,
+		[]clinical.RecordSelection{
+			{EncounterID: encounter.ID, Category: clinical.Diagnosis, RecordID: diag2.ID}, // 合法生效诊断
+			{EncounterID: encounter.ID, Category: clinical.Diagnosis, RecordID: draft.ID}, // 草稿：不合法
+		}, now, now.Add(24*time.Hour))
+	if !errors.Is(err, clinical.ErrInvalidArgument) {
+		die("限定选择夹带草稿应返回 ErrInvalidArgument，实际得到 %v", err)
+	}
+	// 授权未建立：不继续使用任何返回值，合法部分（第二条诊断）也不会被保留。
+	fmt.Printf("限定选择夹带草稿: 被拒绝（%v），整条授权不成立，合法部分不保留\n", clinical.ErrInvalidArgument)
+
+	// ---- 失败演示二：整类范围与限定选择同时为空 ----
+	_, err = store.GrantSelective(doctor, patient.ID, receiver.ID, nil, nil,
+		now, now.Add(24*time.Hour))
+	if !errors.Is(err, clinical.ErrInvalidArgument) {
+		die("空范围空选择应返回 ErrInvalidArgument，实际得到 %v", err)
+	}
+	fmt.Printf("整类范围与限定选择同时为空: 被拒绝（%v），空选择不表示共享全部诊断\n", clinical.ErrInvalidArgument)
+
+	// 两次失败都不新增授权创建审计；原先允许读取的内容保持原样。
+	auditsAfter, err := store.AuditEvents(doctor, patient.ID)
+	must("再次查看审计", err)
+	fmt.Printf("两次失败均未新增授权创建审计: %v\n",
+		countGrants(auditsAfter) == countGrants(auditsBefore))
+
+	res, err = store.Read(receiver, patient.ID, encounter.ID, clinical.Diagnosis)
+	must("失败后读取", err)
+	unchanged := len(res.Records) == 1 &&
+		res.Records[0].RecordID == diag1.ID &&
+		res.Records[0].Version == v2.Number
+	fmt.Printf("失败后读取: 内容保持原样（仍只有第一条的第 %d 版）=%v\n",
+		res.Records[0].Version, unchanged)
+}
+
+// countGrants 统计审计事件中的授权创建条数。
+func countGrants(events []clinical.AuditEvent) int {
+	n := 0
+	for _, e := range events {
+		if e.Action == clinical.ActionGranted {
+			n++
+		}
+	}
+	return n
+}
+
+func must(step string, err error) {
+	if err != nil {
+		die("%s失败: %v", step, err)
+	}
+}
+
+func die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "example: "+format+"\n", args...)
+	os.Exit(1)
+}
+```
+
+结果说明（对照输出）：
+
+```text
+准备完成: 同一次就诊有两条已生效诊断和一条诊断草稿
+建立限定授权: 成功，整类范围 0 项，限定选择 1 条
+接收方首次读取: 记录数=1，只含被选中的第一条（版本=1）=true，第二条与草稿均不出现
+无授权接收方读取: 被拒绝（clinical: access denied），不泄露任何记录
+更正后读取: 仍为 1 条，展示新版本号=2 与新正文=true；旧版本与更正原因不在读取结果中
+授权后新增并生效一条诊断: 读取记录数=1，仍只有第一条=true（新记录不自动进入限定授权）
+限定选择夹带草稿: 被拒绝（clinical: invalid argument），整条授权不成立，合法部分不保留
+整类范围与限定选择同时为空: 被拒绝（clinical: invalid argument），空选择不表示共享全部诊断
+两次失败均未新增授权创建审计: true
+失败后读取: 内容保持原样（仍只有第一条的第 2 版）=true
+```
+
+- **限定读取**：接收方首次读取只得到被选中的第一条诊断（第 1 版），
+  同一次就诊的第二条已生效诊断与诊断草稿都不出现；没有任何授权的其他
+  接收方读取同一范围得到 `ErrAccessDenied`。
+- **更正跟随**：更正被选中的诊断后，读取展示新版本号（第 2 版）与新
+  正文；旧版本与更正原因不在 `Read` 的结果结构中，接收方无从取得。
+- **不自动扩展**：授权后新增并生效的第三条诊断不进入这条限定授权，
+  读取仍只有第一条——限定授权选中的是明确列出的记录本身。
+- **失败是整体的**：把一条合法生效诊断与那条草稿一起放入限定选择，
+  返回 `ErrInvalidArgument`，整条新授权不成立，合法部分不保留，授权
+  创建审计不增加；整类范围与限定选择同时为空同样被拒绝。两次失败后
+  接收方读到的内容与之前完全一致。
+
 ## 取包被拒后仍可登记回执
 
 `FetchPackage`（还能取包）与 `SubmitReceipt`（还能确认已经收到的包）是两项
