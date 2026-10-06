@@ -65,7 +65,9 @@ func (s *Store) AddEncounter(actor Actor, patientID ID, occurredAt time.Time) (E
 }
 
 // DeactivatePatient 停用患者档案。停用后不能新增就诊、改动草稿、使记录生效、
-// 进行更正或新建授权，接收方也无法继续读取；内部使用者仍可查看全部历史。
+// 进行更正、新建授权或创建交换，接收方也无法继续读取或取包；但指定接收方仍可
+// 凭此前取包得到的摘要，对停用前已创建的交换登记回执（只返回确认状态），
+// 内部使用者仍可查看全部历史。
 //
 // 重复停用返回成功且不产生额外变化（不新增审计事件）。
 func (s *Store) DeactivatePatient(actor Actor, patientID ID) error {
