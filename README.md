@@ -256,6 +256,455 @@ func die(format string, args ...any) {
 - **内部查看**：内部使用者能看到正式接受回执（登记时间与确认一致），而摘要
   与原包内容（第 1 版诊断）保持创建时的原值。
 
+## 接收方核对包摘要
+
+接收方 `FetchPackage` 成功后拿到两样东西：固化的包内容
+（`PackageDelivery.Package`）和服务附在交付上的摘要
+（`PackageDelivery.Digest`）。光“保留摘要并在回执中原样回传”只能让服务登记
+回执，不能让接收方自己确认**手中的内容确实与摘要对应的那份一致**。核对方法
+不引入任何新接口或新权限：接收方在**本地**按下面的固定规则，从“收到的包
+字段”重算一遍摘要，再与服务摘要逐字（区分大小写）比较即可。交换库计算摘要
+用的就是这套规则，因此任何一方照此重算都能得到与既有交付一致的结果。
+
+### 参与摘要的包内数据：字段名、类型与顺序
+
+摘要是对一段规范 JSON 字节求 SHA-256。顶层对象与每条记录的字段**名称、
+JSON 类型、出现顺序**都固定如下（顺序不同就算另一个文档）：
+
+顶层（`Package`）：
+
+| JSON 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `patient_id` | 字符串 | 包所属患者标识 |
+| `receiver_id` | 字符串 | 指定接收方标识 |
+| `records` | 数组 | 固化的各记录版本，见下 |
+
+`records` 中每条记录（`PackagedRecord`），按此顺序：
+
+| JSON 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `encounter_id` | 字符串 | 就诊标识 |
+| `category` | 字符串 | 类别，取值为字面量 `"diagnosis"` 或 `"order"` |
+| `record_id` | 字符串 | 记录标识 |
+| `version_id` | 字符串 | 该固化版本的版本标识（与 `record_id` 是两个不同字段） |
+| `version` | 数字（整数，不加引号） | 版本号，如 `2`、`7` |
+| `effective_at` | 字符串 | 生效时间，表示法见下 |
+| `content` | 字符串 | 完整正文，逐字参与 |
+
+只有上述字段参与摘要。正文 `content` 按**逐字字符串**处理：首尾空格、一个
+换行、一个标点的差别都算差异。包里**没有**患者姓名、草稿、旧版本、更正原因
+（`Version.Reason`），这些也**不是**接收方需要另行取得的核对材料——核对仅针对
+交付中的这些字段；接收方的 `Read` 同样看不到草稿、旧版本与更正原因。
+
+### 文字编码与转义
+
+- 整个文档是 **UTF-8** 编码的 JSON，**紧凑输出，无任何多余空白或换行**。
+- 中文（及其它非 ASCII 字符）按 **UTF-8 原样字节**写出，**不**转成
+  `\uXXXX`。
+- 字符串内按 JSON 转义：半角双引号 `"` → `\"`，反斜杠 `\` → `\\`，
+  换行符 → `\n`（其它控制字符按 JSON 规则，如制表符 `\t`、回车 `\r`）。
+- 序列化开启 HTML 转义（与 Go `encoding/json` 的默认 `json.Marshal` 一致）：
+  正文里的 `<`、`>`、`&` 即使出现在字符串中也分别写成
+  `\u003c`、`\u003e`、`\u0026`。这只是换一种转义写法，反解析回字符串后
+  仍是原来的 `<`、`>`、`&`，文字含义不变；接收方重算时必须使用同样的转义，
+  不能把它们改回原样字符再算。
+- 摘要是对这段**精确的 UTF-8 字节序列**求 SHA-256，末尾**不追加换行或空白**。
+
+### 时间表示
+
+- `effective_at` 先把时刻统一转到 **UTC**，再按 Go 的
+  `time.RFC3339Nano` 格式化为字符串：
+  `YYYY-MM-DDTHH:MM:SS.fffffffffZ`，例如
+  `2026-03-14T09:07:05.123456789Z`。
+- 小数秒**保留到实际精度**并去掉尾随零：`.123456000` 写成 `.123456Z`；
+  整秒时刻省略小数部分（`...:05Z`）。丢掉或补出小数位都会得到不同摘要；
+  时刻相差一纳秒摘要也不同。
+- 摘要是**基于时刻（instant）**的，与原时区写法无关：同一时刻用 UTC、`+9`、
+  `-5` 表示，转成 UTC 后字符串相同、摘要相同。因此“换了同一时刻的时区表示”
+  不是内容改动。
+
+### 记录排列规则
+
+- 序列化前，记录一律按 `record_id` 的**字节（字典）升序**排列；
+  `CreateExchange` 入参集合中的顺序、交付切片中的顺序都不影响摘要
+  （重复的记录标识在创建时已合并为一条）。因此“仅改变记录排列顺序”不是
+  内容改动。
+
+### 摘要输出格式
+
+- SHA-256 摘要以**小写十六进制**编码，固定 **64 个字符**（只含 `0-9a-f`），
+  例如 `f790315c…a9fe87`。这正是 `PackageDelivery.Digest` 与
+  `Exchange.Digest` 中保存、回执时须原样回传的字符串。
+
+下面这份规范字节就是后文金向量参与哈希的**精确内容**（诊断
+`rec_diag_golden` 按 `record_id` 排在医嘱 `rec_ord_golden` 之前；注意中文
+原样、`<`/`&` 被转义、引号反斜杠与换行的写法）：
+
+```text
+{"patient_id":"pat_digest_golden_01","receiver_id":"rcv_digest_golden","records":[{"encounter_id":"enc_digest_golden_01","category":"diagnosis","record_id":"rec_diag_golden","version_id":"ver_diag_golden_2nd","version":2,"effective_at":"2026-03-14T09:07:05.123456789Z","content":"2型糖尿病（E11.9）\n患者自述：\"多饮、多尿\"，标记 a\u003cb 与 c\u0026d；目录 C:\\病历"},{"encounter_id":"enc_digest_golden_01","category":"order","record_id":"rec_ord_golden","version_id":"ver_ord_golden_7th","version":7,"effective_at":"2026-03-14T09:07:05.123456789Z","content":"医嘱：胰岛素 8IU（餐前）\n注意 \"剂量\u003c10IU 需复核\"；配伍 5%GS\u00260.9%NS；路径 C:\\泵注"}]}
+```
+
+对这段字节求 SHA-256（等价于 `printf '%s' '<上面整行>' | sha256sum`）得到：
+
+```text
+f790315c6ceffc7d462d574b3e789acbf8ee71f95b028934cbe2bd2be9a9fe87
+```
+
+### 包内容与包外信息
+
+摘要只覆盖上面的包内容，**交换标识、绑定授权标识、请求号、创建交换的内部
+使用者、交换当前状态、交换创建时间，以及回执的结果/原因/登记时间都不参与
+摘要**。因此交换从 `pending_receipt` 变为 `accepted`/`rejected`、登记或
+重交回执，都不会改变摘要；同一包内容经由不同交换标识、不同请求号或不同
+（同样合法的）授权交付，摘要相同。取包权限随绑定授权与患者状态变化，但那只
+决定**能否取包**，不影响包摘要本身。
+
+### 完整使用示例
+
+完整程序位于
+[`examples/verify_digest`](examples/verify_digest/main.go)
+（`go run ./examples/verify_digest`）。它先用上面的**固定金向量**（输入与期望
+摘要都确定，可逐字节复现），再走真实公开流程（登记合成患者 → 就诊 → 诊断/
+医嘱 → 授权 → 创建交换 → 接收方取包）。示例中的 `ReceiverDigest` 只用交付
+中的公开字段、在接收方一侧独立重算，不调用交换库的任何内部函数；正文包含
+中文、换行、引号、反斜杠、`<`、`&`，生效时间保留九位小数秒：
+
+```go
+// 命令 verify_digest 面向接收方演示“取包后如何独立核对摘要”。
+//
+// 接收方取包（FetchPackage）拿到的是固化的包内容（clinical.Package）与服务
+// 附在交付上的摘要（PackageDelivery.Digest）。本示例不依赖任何未导出能力：
+// 接收方按文档中公开的规范序列化规则，在本地从“收到的字段”重算一遍摘要，
+// 再与服务摘要逐字比较——
+//
+//	本地摘要 == 服务摘要：收到的内容与服务固化并标注的那份逐字节一致；
+//	本地摘要 != 服务摘要：收到的内容至少有一处与服务保存的不同（哪怕只改
+//	                     一个字符、一个换行、丢一位小数秒）。
+//
+// 示例分两部分：
+//
+//	第一部分用文档中的固定金向量（确定的输入、确定的期望摘要），证明本地
+//	重算规则可复现既有交付；只改正文一个字符即得到不同摘要。
+//	第二部分走真实公开流程（登记合成患者→就诊→诊断/医嘱→授权→创建交换→
+//	接收方取包），对真实交付做本地核对、重排/时区等价核对、正文篡改核对，
+//	最后说明 SubmitReceipt 只比较“提交的摘要字符串”与“交换保存的摘要”，
+//	并不重新检查接收方手中的临床内容。
+//
+// 全程只使用合成患者资料。运行：
+//
+//	go run ./examples/verify_digest
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"time"
+
+	"github.com/bengzyyys/clinical-exchange/clinical"
+)
+
+func main() {
+	// ===== 第一部分：固定金向量，输入与期望摘要都是确定的 =====
+
+	golden := clinical.Package{
+		PatientID:  "pat_digest_golden_01",
+		ReceiverID: "rcv_digest_golden",
+		Records: []clinical.PackagedRecord{
+			// 故意把医嘱放在诊断前面：规范序列化会先按 record_id 排序，
+			// 入参排列不影响摘要。
+			{
+				EncounterID: "enc_digest_golden_01",
+				Category:    clinical.Order,
+				RecordID:    "rec_ord_golden",
+				VersionID:   "ver_ord_golden_7th",
+				Version:     7,
+				EffectiveAt: time.Date(2026, 3, 14, 9, 7, 5, 123456789, time.UTC),
+				Content:     "医嘱：胰岛素 8IU（餐前）\n注意 \"剂量<10IU 需复核\"；配伍 5%GS&0.9%NS；路径 C:\\泵注",
+			},
+			{
+				EncounterID: "enc_digest_golden_01",
+				Category:    clinical.Diagnosis,
+				RecordID:    "rec_diag_golden",
+				VersionID:   "ver_diag_golden_2nd",
+				Version:     2,
+				EffectiveAt: time.Date(2026, 3, 14, 9, 7, 5, 123456789, time.UTC),
+				Content:     "2型糖尿病（E11.9）\n患者自述：\"多饮、多尿\"，标记 a<b 与 c&d；目录 C:\\病历",
+			},
+		},
+	}
+
+	const wantGoldenDigest = "f790315c6ceffc7d462d574b3e789acbf8ee71f95b028934cbe2bd2be9a9fe87"
+
+	fmt.Println("== 金向量：按文档规则在本地从收到的字段重算 ==")
+	fmt.Printf("规范字节: %s\n", mustCanonical(golden))
+	goldenLocal := ReceiverDigest(golden)
+	fmt.Printf("本地摘要: %s\n", goldenLocal)
+	fmt.Printf("核对结果: 本地摘要 == 期望摘要 %v\n", goldenLocal == wantGoldenDigest)
+
+	// 只改收到的诊断正文中的一个字符（小于号 -> 书名号），其余全部不动。
+	tampered := golden
+	tampered.Records = append([]clinical.PackagedRecord(nil), golden.Records...)
+	tampered.Records[1].Content = "2型糖尿病（E11.9）\n患者自述：\"多饮、多尿\"，标记 a《b 与 c&d；目录 C:\\病历"
+	tamperedLocal := ReceiverDigest(tampered)
+	fmt.Printf("只改一个字符后的本地摘要: %s\n", tamperedLocal)
+	fmt.Printf("核对结果: 改动后摘要 == 原期望摘要 %v；原先保存的服务摘要仍是 %s\n",
+		tamperedLocal == wantGoldenDigest, wantGoldenDigest)
+
+	// ===== 第二部分：真实公开流程，对一份合成交换包端到端核对 =====
+
+	fmt.Println()
+	fmt.Println("== 端到端：真实合成交换包的取包核对与回执 ==")
+
+	dir, err := os.MkdirTemp("", "clinical-verify-")
+	must("创建临时数据目录", err)
+	defer os.RemoveAll(dir)
+
+	// 固定时钟到带小数秒的时刻，使生效时间保留纳秒小数（非整秒）。
+	clockTime := time.Date(2026, 3, 14, 9, 7, 5, 123456789, time.UTC)
+	store, err := clinical.Open(dir, clinical.WithClock(func() time.Time { return clockTime }))
+	must("打开本地存储", err)
+	defer store.Close()
+
+	doctor := clinical.InternalActor("doctor-1")
+	receiver := clinical.ReceiverActor("insurer-1")
+
+	patient, err := store.RegisterPatient(doctor, "摘要核对合成患者")
+	must("登记合成患者", err)
+	encounter, err := store.AddEncounter(doctor, patient.ID, clockTime.Add(-3*time.Hour))
+	must("登记就诊", err)
+
+	// 诊断与医嘱正文都含中文、换行、半角双引号、反斜杠、小于号、与号。
+	diagDraft, err := store.CreateDraft(doctor, patient.ID, encounter.ID, clinical.Diagnosis,
+		"2型糖尿病（E11.9）\n患者自述：\"多饮、多尿\"，标记 a<b 与 c&d；目录 C:\\病历")
+	must("创建诊断草稿", err)
+	if _, err := store.ActivateRecord(doctor, diagDraft.ID); err != nil {
+		die("生效诊断失败: %v", err)
+	}
+	orderDraft, err := store.CreateDraft(doctor, patient.ID, encounter.ID, clinical.Order,
+		"医嘱：胰岛素 8IU（餐前）\n注意 \"剂量<10IU 需复核\"；配伍 5%GS&0.9%NS；路径 C:\\泵注")
+	must("创建医嘱草稿", err)
+	if _, err := store.ActivateRecord(doctor, orderDraft.ID); err != nil {
+		die("生效医嘱失败: %v", err)
+	}
+
+	grant, err := store.Grant(doctor, patient.ID, receiver.ID,
+		[]clinical.Scope{
+			{EncounterID: encounter.ID, Category: clinical.Diagnosis},
+			{EncounterID: encounter.ID, Category: clinical.Order},
+		},
+		clockTime.Add(-24*time.Hour), clockTime.Add(24*time.Hour))
+	must("建立授权", err)
+
+	// 故意“医嘱在前、诊断在后”提交：服务固化时按 record_id 排序，与入参顺序无关。
+	exchange, err := store.CreateExchange(doctor, patient.ID, receiver.ID, grant.ID,
+		[]clinical.ID{orderDraft.ID, diagDraft.ID}, "request-verify-digest")
+	must("创建交换", err)
+
+	delivery, err := store.FetchPackage(receiver, exchange.ID)
+	must("接收方取包", err)
+
+	serviceDigest := delivery.Digest //取包时服务交付并保存的摘要：核对的比较基准，应原样留存。
+
+	// 1) 正常输入：本地按收到的字段重算，与服务摘要一致。
+	localDigest := ReceiverDigest(delivery.Package)
+	fmt.Printf("正常取包核对: 本地摘要 == 服务摘要 %v（服务摘要=%s）\n",
+		localDigest == serviceDigest, serviceDigest)
+	fmt.Println("说明: 端到端各标识由服务随机生成，故该十六进制值每次运行不同；")
+	fmt.Println("      确定性的固定值见上方金向量。此处要对照的是各“是否一致”的结论。")
+
+	// 2) 仅改变记录排列顺序：内容未变，摘要必须相同。
+	reordered := delivery.Package
+	reordered.Records = append([]clinical.PackagedRecord(nil), delivery.Package.Records...)
+	reordered.Records[0], reordered.Records[1] = reordered.Records[1], reordered.Records[0]
+	fmt.Printf("仅调换记录顺序: 本地摘要 == 服务摘要 %v\n",
+		ReceiverDigest(reordered) == serviceDigest)
+
+	// 3) 同一时刻换时区表示（+9/-5 与 UTC 是同一瞬间）：内容未变，摘要必须相同。
+	east := time.FixedZone("UTC+9", 9*60*60)
+	west := time.FixedZone("UTC-5", -5*60*60)
+	rezoned := delivery.Package
+	rezoned.Records = append([]clinical.PackagedRecord(nil), delivery.Package.Records...)
+	rezoned.Records[0].EffectiveAt = rezoned.Records[0].EffectiveAt.In(east)
+	rezoned.Records[1].EffectiveAt = rezoned.Records[1].EffectiveAt.In(west)
+	fmt.Printf("仅换同一时刻的时区表示: 本地摘要 == 服务摘要 %v\n",
+		ReceiverDigest(rezoned) == serviceDigest)
+
+	// 4) 只改收到的诊断正文一个字符：本地摘要立即不同；保存的服务摘要保持原值，
+	//    仍是比较依据。
+	received := delivery.Package
+	received.Records = append([]clinical.PackagedRecord(nil), delivery.Package.Records...)
+	for i := range received.Records {
+		if received.Records[i].Category == clinical.Diagnosis {
+			received.Records[i].Content =
+				"2型糖尿病（E11.9）\n患者自述：\"多饮、多尿\"，标记 a《b 与 c&d；目录 C:\\病历"
+		}
+	}
+	tamperedDigest := ReceiverDigest(received)
+	fmt.Printf("只改收到的正文一个字符: 本地摘要 == 服务摘要 %v；本地新摘要 != 服务摘要 %v；服务摘要保持原值 %v\n",
+		tamperedDigest == serviceDigest, tamperedDigest != serviceDigest, serviceDigest == delivery.Digest)
+
+	// 5) 核对与回执的关系：SubmitReceipt 比较“提交的摘要”与“交换保存的摘要”，
+	//    不重新检查接收方手中的临床内容。
+	conf, err := store.SubmitReceipt(receiver, exchange.ID, serviceDigest, clinical.ReceiptAccepted, "")
+	must("凭原服务摘要登记接受回执", err)
+	fmt.Printf("凭原服务摘要登记回执: 成功，交换状态=%s，回执结果=%s\n", conf.Status, conf.Outcome)
+
+	if _, err := store.SubmitReceipt(receiver, exchange.ID, tamperedDigest,
+		clinical.ReceiptAccepted, ""); !errors.Is(err, clinical.ErrConflict) {
+		die("用被改正文算出的摘要登记回执应得到 ErrConflict，实际 %v", err)
+	}
+	fmt.Printf("凭被改正文算出的摘要登记回执: 被拒绝（%v）；服务并未读取本地正文，只比对摘要字符串\n",
+		clinical.ErrConflict)
+}
+
+// ReceiverDigest 是接收方一侧的独立重算：严格按文档的规范序列化规则，
+// 从“收到的包字段”算出 64 位小写十六进制 sha256。它不调用交换库的任何
+// 内部函数——这正是接收方不预先信任服务摘要、自行核对所需要做的事。
+func ReceiverDigest(p clinical.Package) string {
+	recs := append([]clinical.PackagedRecord(nil), p.Records...)
+	// 记录先按 record_id 字节序升序排列，与入参/交付中的排列无关。
+	sort.Slice(recs, func(i, j int) bool { return recs[i].RecordID < recs[j].RecordID })
+
+	cp := canonicalPackage{
+		PatientID:  p.PatientID,
+		ReceiverID: p.ReceiverID,
+		Records:    make([]canonicalRecord, 0, len(recs)),
+	}
+	for _, r := range recs {
+		cp.Records = append(cp.Records, canonicalRecord{
+			EncounterID: r.EncounterID,
+			Category:    r.Category,
+			RecordID:    r.RecordID,
+			VersionID:   r.VersionID,
+			Version:     r.Version,
+			// 时间先转 UTC，再按 RFC3339Nano 表示（保留小数秒、去掉尾随零）。
+			EffectiveAt: r.EffectiveAt.UTC().Format(time.RFC3339Nano),
+			Content:     r.Content,
+		})
+	}
+	// json.Marshal 默认紧凑无空白，并对 <、>、& 做 \u003c/\u003e/\u0026
+	// 转义；中文等非 ASCII 字符按 UTF-8 原样写出。
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(raw) // 对精确的 UTF-8 字节序列求摘要，不追加换行。
+	return hex.EncodeToString(sum[:])
+}
+
+func mustCanonical(p clinical.Package) string {
+	recs := append([]clinical.PackagedRecord(nil), p.Records...)
+	sort.Slice(recs, func(i, j int) bool { return recs[i].RecordID < recs[j].RecordID })
+	cp := canonicalPackage{
+		PatientID:  p.PatientID,
+		ReceiverID: p.ReceiverID,
+		Records:    make([]canonicalRecord, 0, len(recs)),
+	}
+	for _, r := range recs {
+		cp.Records = append(cp.Records, canonicalRecord{
+			EncounterID: r.EncounterID,
+			Category:    r.Category,
+			RecordID:    r.RecordID,
+			VersionID:   r.VersionID,
+			Version:     r.Version,
+			EffectiveAt: r.EffectiveAt.UTC().Format(time.RFC3339Nano),
+			Content:     r.Content,
+		})
+	}
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
+}
+
+// 字段名与顺序固定的规范结构，与交换库内部摘要规则一致。
+type canonicalRecord struct {
+	EncounterID string `json:"encounter_id"`
+	Category    string `json:"category"`
+	RecordID    string `json:"record_id"`
+	VersionID   string `json:"version_id"`
+	Version     int    `json:"version"`
+	EffectiveAt string `json:"effective_at"`
+	Content     string `json:"content"`
+}
+
+type canonicalPackage struct {
+	PatientID  string            `json:"patient_id"`
+	ReceiverID string            `json:"receiver_id"`
+	Records    []canonicalRecord `json:"records"`
+}
+
+func must(step string, err error) {
+	if err != nil {
+		die("%s失败: %v", step, err)
+	}
+}
+
+func die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "example: "+format+"\n", args...)
+	os.Exit(1)
+}
+```
+
+可对照的输出（金向量部分的两个摘要是确定值；端到端那行服务摘要因
+患者/记录标识由服务随机生成，**每次运行不同**，要对照的是各“是否一致”的
+结论）：
+
+```text
+== 金向量：按文档规则在本地从收到的字段重算 ==
+规范字节: {"patient_id":"pat_digest_golden_01", … ,"content":"医嘱：胰岛素 8IU（餐前）\n注意 \"剂量\u003c10IU 需复核\"；配伍 5%GS\u00260.9%NS；路径 C:\\泵注"}]}
+本地摘要: f790315c6ceffc7d462d574b3e789acbf8ee71f95b028934cbe2bd2be9a9fe87
+核对结果: 本地摘要 == 期望摘要 true
+只改一个字符后的本地摘要: 11adfc39d2e697525a145d33b3494437efebfc04b2932114449d278a4b7f0607
+核对结果: 改动后摘要 == 原期望摘要 false；原先保存的服务摘要仍是 f790315c6ceffc7d462d574b3e789acbf8ee71f95b028934cbe2bd2be9a9fe87
+
+== 端到端：真实合成交换包的取包核对与回执 ==
+正常取包核对: 本地摘要 == 服务摘要 true（服务摘要=<每次运行不同>）
+说明: 端到端各标识由服务随机生成，故该十六进制值每次运行不同；
+      确定性的固定值见上方金向量。此处要对照的是各“是否一致”的结论。
+仅调换记录顺序: 本地摘要 == 服务摘要 true
+仅换同一时刻的时区表示: 本地摘要 == 服务摘要 true
+只改收到的正文一个字符: 本地摘要 == 服务摘要 false；本地新摘要 != 服务摘要 true；服务摘要保持原值 true
+凭原服务摘要登记回执: 成功，交换状态=accepted，回执结果=accepted
+凭被改正文算出的摘要登记回执: 被拒绝（clinical: version conflict）；服务并未读取本地正文，只比对摘要字符串
+```
+
+结果说明（区分三个量）：
+
+- **服务摘要**：取包时 `delivery.Digest` 给出、交换创建时已保存的那个
+  64 位十六进制值，是核对与回执共同的比较基准，应原样留存。
+- **本地摘要**：接收方用 `ReceiverDigest` 从**收到的字段**独立算出的值。
+- **是否匹配**：上述两个字符串逐字比较的布尔结果。
+- **正常输入**：两者相等（金向量中本地值正好等于上文固定期望摘要
+  `f790…e87`），说明收到的包与服务固化并标注的那份逐字节一致。
+- **只改动收到的正文**（示例中诊断正文的一个 `<` 改成 `《`）：本地摘要变为
+  `11ad…0607`，与服务摘要**不匹配**；服务保存的摘要不会被接收方一侧的改动
+  影响，仍是原来的 `f790…e87`，继续作为比较依据。调换记录顺序、或把同一
+  时刻换成 `+9`/`-5` 时区表示，本地摘要都**保持不变**——那不是内容改动。
+
+### 本地核对与回执登记的关系
+
+- **本地核对回答的是“我手里这份对不对”**：本地摘要与服务摘要一致，只证明
+  接收方收到的 `Package` 字节与服务创建时固化、并在交付中标注的那份一致；
+  它纯粹发生在接收方本地，不向服务登记任何东西，也不改变交换状态。
+- **`SubmitReceipt` 回答的是“服务是否记录我确认了这次交换”**：它只比较
+  **提交的摘要字符串**与**该交换保存的摘要**——相等才把状态从
+  `pending_receipt` 置为 `accepted`/`rejected`；不符返回 `ErrConflict` 且
+  状态不变。它**不会重新读取或检查接收方手中的临床内容**：示例里用“被改
+  正文算出的摘要”登记即得到 `ErrConflict`，原因只是字符串对不上，而非服务
+  发现了正文被改。
+- **为什么本地核对成功后仍要按既有方式提交回执**：本地核对成功只让接收方
+  自己放心；内部使用者需要通过回执才知道这份包已被接受或拒绝（首次成功
+  登记还会写回执审计）。因此确认无误后，仍应取包时留存的**原服务摘要**
+  （而不是对被改副本另算的值）按既有方式调用 `SubmitReceipt`。取包权限、
+  回执判定与摘要格式均保持不变，本节只是补齐接收方一侧的核对方法与示例。
+
 ## 身份模型
 
 | 身份 | 能力 |
