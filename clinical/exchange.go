@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // PackageDelivery 是指定接收方取包时得到的视图：交换标识、当前状态、
@@ -37,8 +38,8 @@ type ReceiptConfirmation struct {
 // 患者且已经生效；每条记录都必须被绑定的那一条授权覆盖——整类范围按记录的
 // 就诊+类别覆盖，限定范围只覆盖明确选中的记录，不能借用同一接收方的其他
 // 授权补足。授权必须属于该患者与接收方且在当前时间有效。空集合、空白请求号、
-// 不存在或跨患者的引用、夹带草稿、记录不被绑定授权覆盖、授权不符一律拒绝，
-// 不留下交换或审计，也不占用请求号。患者停用后不能新建交换。
+// 夹带无效 UTF-8 字节的请求号、不存在或跨患者的引用、夹带草稿、记录不被绑定
+// 授权覆盖、授权不符一律拒绝，不留下交换或审计，也不占用请求号。患者停用后不能新建交换。
 //
 // 成功后包内容固化为创建时各记录的当前生效版本（重复记录标识合并），并计算
 // 稳定摘要，状态为待回执；交换与审计事件在同一次原子落盘中保留。此后记录被
@@ -64,6 +65,15 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 	}
 	if strings.TrimSpace(requestID) == "" {
 		return Exchange{}, fmt.Errorf("%w: request id is required", ErrInvalidArgument)
+	}
+	// 请求号必须是完整合法的 UTF-8：本地快照以 JSON 落盘，encoding/json
+	// 会把无效字节静默替换为 U+FFFD——若放行，重开后保存的请求号与提交时
+	// 不同，原请求号重试找不到原交换，还可能与另一份明确含 U+FFFD 的合法
+	// 请求号撞成同一个。因此夹带任何无效字节或不完整多字节字符的请求号
+	// 一律拒绝，绝不靠替换、截断或跳过坏字节继续创建；用户明确输入的合法
+	// U+FFFD 字符本身是合法 UTF-8，不受此限制。
+	if !utf8.ValidString(requestID) {
+		return Exchange{}, fmt.Errorf("%w: request id must be valid UTF-8", ErrInvalidArgument)
 	}
 	if len(recordIDs) == 0 {
 		return Exchange{}, fmt.Errorf("%w: record id set must not be empty", ErrInvalidArgument)
