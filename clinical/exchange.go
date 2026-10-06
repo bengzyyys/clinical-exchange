@@ -248,13 +248,19 @@ func (s *Store) FetchPackage(actor Actor, exchangeID ID) (PackageDelivery, error
 // SubmitReceipt 供指定接收方对一份包登记回执：提供交换标识、取包时得到的
 // 包摘要、接受或拒绝的结果及原因。
 //
-// 非法结果、拒绝时原因为空白返回 ErrInvalidArgument。只有指定接收方且摘要
-// 吻合，才能把交换从待回执变为已接受或已拒绝；摘要不符返回 ErrConflict，
-// 状态不变。相同回执（结果与原因均相同）重交只是确认已保存的那份回执：
-// 返回原确认（登记时间保持首次成功登记时的值），不新增审计、不改写已保存
-// 数据，也不触发落盘——即使本地保存条件当前不可用，重交仍成功返回原确认；
-// 结果或原因改变返回 ErrConflict，与当前能否保存无关。其他身份不能代交，
-// 不存在的交换统一拒绝。
+// 非法结果、拒绝时原因为空白返回 ErrInvalidArgument。拒绝原因还必须是完整
+// 合法的 UTF-8：本地快照以 JSON 落盘，encoding/json 会把无效字节静默替换为
+// U+FFFD——若放行，当次内部查询还能看到提交的原字节，关闭重开后原因却已被
+// 改写，原样原因重交也会因此被判为原因不同。因此夹带任何无效字节或不完整
+// 多字节字符的拒绝原因一律拒绝，绝不靠替换、截断或跳过坏字节继续登记；
+// 用户明确输入的合法 U+FFFD 字符本身是合法 UTF-8，不受此限制。只有指定
+// 接收方且摘要吻合，才能把交换从待回执变为已接受或已拒绝；摘要不符返回
+// ErrConflict，状态不变。相同回执（结果与原因均相同）重交只是确认已保存
+// 的那份回执：返回原确认（登记时间保持首次成功登记时的值），不新增审计、
+// 不改写已保存数据，也不触发落盘——即使本地保存条件当前不可用，重交仍
+// 成功返回原确认；结果或原因改变返回 ErrConflict，与当前能否保存无关。
+// 其他身份不能代交，不存在的交换统一拒绝。接受回执不保存原因：传入的原因
+// （即使夹带无效字节）一律忽略为空，既不会因此拒绝接受，也不参与重交判定。
 //
 // 授权失效或患者停用后仍允许登记此前包的回执，但响应只返回确认状态，
 // 不提供任何受保护内容。
@@ -268,11 +274,19 @@ func (s *Store) SubmitReceipt(actor Actor, exchangeID ID, digest, outcome, reaso
 	if outcome != ReceiptAccepted && outcome != ReceiptRejected {
 		return ReceiptConfirmation{}, fmt.Errorf("%w: outcome must be %q or %q", ErrInvalidArgument, ReceiptAccepted, ReceiptRejected)
 	}
-	if outcome == ReceiptRejected && strings.TrimSpace(reason) == "" {
-		return ReceiptConfirmation{}, fmt.Errorf("%w: rejection reason is required", ErrInvalidArgument)
-	}
-	if outcome == ReceiptAccepted {
-		// 接受不携带原因；统一归一化，保证重复提交判定稳定。
+	if outcome == ReceiptRejected {
+		if strings.TrimSpace(reason) == "" {
+			return ReceiptConfirmation{}, fmt.Errorf("%w: rejection reason is required", ErrInvalidArgument)
+		}
+		// 拒绝原因会随回执原样落盘，必须是完整合法的 UTF-8：坏字节位于开头、
+		// 中间、结尾，或最后一个多字节字符没有写完整，都在此拒绝，不能让 JSON
+		// 落盘把原因替换成 U+FFFD，导致重开后的原因与接收方提交时不同。
+		if !utf8.ValidString(reason) {
+			return ReceiptConfirmation{}, fmt.Errorf("%w: rejection reason must be valid UTF-8", ErrInvalidArgument)
+		}
+	} else {
+		// 接受不携带原因；统一归一化，保证重复提交判定稳定。被忽略的原因
+		// 即使夹带无效字节也不影响接受登记。
 		reason = ""
 	}
 

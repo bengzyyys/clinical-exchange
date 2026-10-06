@@ -220,7 +220,8 @@ type Package struct {
 	Records    []PackagedRecord
 }
 
-// Receipt 是接收方对一份包的回执。接受时 Reason 为空；拒绝时 Reason 必填。
+// Receipt 是接收方对一份包的回执。接受时 Reason 为空（传入原因一律忽略）；
+// 拒绝时 Reason 必填、非空白且必须是合法 UTF-8，原样保存。
 type Receipt struct {
 	Outcome      string
 	Reason       string
