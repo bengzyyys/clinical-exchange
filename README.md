@@ -14,7 +14,7 @@ go test ./...
 - `clinical.Open(dir)` 打开/创建本地数据目录（带文件锁，同一目录不允许两个进程同时打开）；`Store.Close()` 关闭。
 - **患者与就诊**：内部使用者登记合成患者与就诊，患者、就诊、记录、版本、授权均有稳定标识；引用不存在的对象或跨患者混用数据会明确失败，不留下半条记录。
 - **草稿 → 生效 → 更正**：诊断/医嘱先存为草稿，可改可删；`ActivateRecord` 固化当时的完整内容与时间。生效记录不可直接覆盖或删除；`CorrectRecord` 必须带非空原因和当前版本号，成功后生成新版本（保留旧内容、`PrevID` 版本链与原因），版本过期返回 `ErrConflict`。
-- **授权与接收方读取**：`Grant` 建立整类授权，范围由明确的“就诊 + 诊断/医嘱类别”组成；`GrantSelective` 还可在该就诊的诊断或医嘱中明确选出若干条**已生效记录**（`RecordSelection`）。同一条授权可包含多个就诊、类别，整类范围与选定记录范围可以并存；重复选择同一记录只算一次。被选记录更正后授权覆盖它的当前版本，但同一就诊同类的其他记录以及后来新增、生效的记录都不会自动进入限定范围。授权带 `[开始, 截止)` 时间窗；空范围、空选择、空白标识、跨患者、选择草稿或记录与声明的就诊/类别不符均拒绝（空选择不会被当成整类授权），任一选择不合法就拒绝整条授权。接收方 `Read` 只能看到所有当前有效授权允许记录的合集（每条只出现一次、按稳定顺序），看不到草稿、旧版本或更正原因；未开始、已到期、已撤回或无授权一律返回 `ErrAccessDenied`，不泄露未授权记录的标识、数量或内容。整类与限定重叠时可见整类内容；撤回整类授权后只剩其他有效授权明确允许的记录。多授权独立判断，撤回互不影响；可 `Revoke` 提前撤回。
+- **授权与接收方读取**：`Grant` 建立整类授权，范围由明确的“就诊 + 诊断/医嘱类别”组成；`GrantSelective` 还可在该就诊的诊断或医嘱中明确选出若干条**已生效记录**（`RecordSelection`）。同一条授权可包含多个就诊、类别，整类范围与选定记录范围可以并存；重复选择同一记录只算一次。被选记录更正后授权覆盖它的当前版本，但同一就诊同类的其他记录以及后来新增、生效的记录都不会自动进入限定范围。授权带 `[开始, 截止)` 时间窗；空范围、空选择、空白标识、跨患者、选择草稿或记录与声明的就诊/类别不符均拒绝（空选择不会被当成整类授权），任一选择不合法就拒绝整条授权。接收方 `Read` 只能看到所有当前有效授权允许记录的合集（每条只出现一次、按稳定顺序），看不到草稿、旧版本或更正原因；未开始、已到期、已撤回或无授权一律返回 `ErrAccessDenied`，不泄露未授权记录的标识、数量或内容。整类与限定重叠时可见整类内容；撤回整类授权后只剩其他有效授权明确允许的记录。多授权独立判断，撤回互不影响；可 `Revoke` 提前撤回。内部使用者可用 `ListAuthorizations` 按患者（可再按接收方）列出该患者已保存的**全部**授权（含尚未开始、已到期、已撤回者，按授权标识升序）；清单只是历史视图，列出一条授权不代表接收方此刻能读取临床内容，接收方身份不可调用。
 - **打包交换与回执**：内部使用者 `CreateExchange` 指定患者、接收方、一条当前有效授权、已生效记录集合与非空请求号，把记录的**创建时当前版本**固化成包并计算摘要，状态为待回执。所选每条记录都必须被**绑定的那一条授权**自身覆盖（整类或选定记录），不能借用同一接收方的其他授权补足；记录跨患者、夹带草稿、夹带一条不被绑定授权覆盖的记录、授权不符、患者停用一律拒绝，不留交换或审计，也不占用请求号。请求号按内部使用者区分：相同请求号与相同参数（集合顺序无关）重试返回原交换及现有状态，不重新取内容或新增审计；其他参数变化返回 `ErrConflict`。接收方 `FetchPackage` 按等待结束、真正开始核对本次取包权限的时刻重新检查绑定授权与患者状态（提前发出的请求不会延长授权有效期；其他有效授权不能替代），`SubmitReceipt` 凭摘要登记接受/拒绝回执；授权失效或患者停用后取包被拒，但此前包的回执仍可登记，且只返回确认状态。内部使用者可用 `GetExchange`/`ListExchanges` 按患者查看原包与回执，停用后亦可。
 - **停用**：停用后不能新增就诊、改草稿、生效、更正、新建授权，接收方也不能继续读取或取包；但接收方对停用前已取得的包仍可登记回执，内部使用者仍能查看完整历史。重复停用/撤回幂等，不产生额外变化。
 - **审计**：生效、更正、授权创建与撤回、档案停用、交换创建与首次回执登记均记录操作身份、时间、对象与动作，仅供内部使用者按患者查看。
@@ -311,6 +311,498 @@ func die(format string, args ...any) {
   返回 `ErrInvalidArgument`，整条新授权不成立，合法部分不保留，授权
   创建审计不增加；整类范围与限定选择同时为空同样被拒绝。两次失败后
   接收方读到的内容与之前完全一致。
+
+## 内部使用者查看患者授权清单
+
+`ListAuthorizations(actor, patientID, receiverID)` 仅供**内部使用者**使用：
+按患者列出该患者档案下**已保存的全部授权**。它是一份只读的历史视图，不是
+“接收方此刻能读到哪些临床内容”——清单里出现一条授权，只说明这条授权被建立
+并保存在该患者名下，不代表接收方凭它现在就能 `Read`；接收方实际读取时仍按
+既有规则在读取时刻重新逐条判断授权与患者状态，不能用清单代替这项检查。
+
+- **只按患者查询**：`receiverID` 传**空字符串**，列出该患者授予**所有接收方**
+  的授权。**再指定接收方**：填写接收方标识，只保留授予该接收方的条目。两个
+  过滤条件同时作用：即使另一名患者也授权给了同一个接收方，那一条也不会混入
+  本患者的清单；反过来，同患者授予其他接收方的条目也不会因为指定了接收方而
+  出现。
+- **空清单是成功结果**：患者存在但从无授权，或指定的接收方没有获得该患者的
+  任何授权，都正常返回错误为空、长度为 0 的清单——既不表示患者不存在，也不
+  表示查询被拒绝。只有患者标识本身不存在时才返回 `ErrNotFound`。
+- **结果按授权标识升序排列**（标识的字符串字典序），不是按创建时间排序；
+  不要把返回顺序当作建立先后顺序使用。
+- **四种生命周期状态全部入列**：当前有效、尚未开始、已经到期、已经撤回的授权
+  都在。每条保留**自己的**接收方、整类范围、限定记录范围、时间窗
+  `[StartsAt, ExpiresAt)` 与撤回时间 `RevokedAt`；多条授权永远各自独立成行，
+  不会把同一接收方或同一范围的多条授权合并成一条，撤回一条也不影响其他条目。
+- **整类范围与限定记录范围在结果中可区分**：`Scopes` 非空表示整类范围
+  （某就诊下某类别的**全部**已生效记录，含授权后才生效者），`Selections`
+  非空表示限定记录范围（只含明确选出的记录）；两者可以同时非空，表示同一条
+  授权两种范围并存。列表原样保留这种区别，不会把限定范围改写成整类范围。
+- **`ActiveAt(t)` 只判断授权自身**：它只看该授权的时间窗与撤回状态——已撤回
+  恒为无效；未撤回时采用**包含开始时刻、不包含截止时刻**的半开区间
+  `[StartsAt, ExpiresAt)`：`t == StartsAt` 有效，`t == ExpiresAt` 已失效。它
+  不判断患者是否停用，也不判断接收方是谁；能否读取临床内容仍须以实际 `Read`
+  /`FetchPackage` 的结果为准。
+- **患者停用后仍可列出历史授权**：停用不清空、不拒绝此查询，撤回时间等历史
+  字段照样返回；但接收方此时读取或取包一律 `ErrAccessDenied`。
+- **两种失败**：
+  - 内部使用者查询**不存在的患者**（无论是否指定接收方）返回 `ErrNotFound`，
+    不带回任何条目。
+  - **接收方不能调用这个内部查询**：即使该接收方持有该患者当前有效的授权，
+    也返回 `ErrAccessDenied`，结果为空、不提供任何授权资料——按自己的标识
+    过滤同样被拒。查看清单本身是只读操作，不新增授权或审计。
+
+下面的完整示例位于
+[`examples/list_authorizations`](examples/list_authorizations/main.go)
+（`go run ./examples/list_authorizations`）。它自行准备本地存储、内部使用者、
+两名接收方、一名合成患者与一次就诊（两条已生效诊断、一条已生效医嘱），由同一
+患者向两个接收方建立 4 条授权——当前有效的整类授权、尚未开始的限定授权、已经
+到期的整类授权、建立后即被撤回的限定授权；再登记另一名也授权给同一接收方的
+合成患者与一名从无授权的合成患者。示例展示不指定接收方与指定接收方的清单差异、
+撤回授权仍在清单中、清单不能替代实际读取、跨患者不混入、成功的空清单，以及
+`ErrNotFound` 与接收方 `ErrAccessDenied` 两种失败，最后停用患者对比“内部仍可
+列出 / 接收方读取被拒”。示例对每一步业务调用都检查错误：任一准备步骤失败时由
+`must` 明确指出失败的操作并立即终止，不把失败返回值当作正式患者、记录或授权
+继续使用：
+
+```go
+// 命令 list_authorizations 演示内部使用者如何用 ListAuthorizations 查看某名
+// 合成患者已保存的授权清单。
+//
+// 清单是“历史视图”，不是“接收方此刻能读什么”：同一名患者授予两个接收方的
+// 当前有效、尚未开始、已经到期与已经撤回的授权都会原样列出，每条保留各自的
+// 整类范围、限定记录范围、时间窗与撤回时间。示例同时演示：
+//   - 只按患者查询（接收方参数传空字符串）与再指定接收方的差异；
+//   - 另一名患者授权给同一个接收方不会混入本患者清单；
+//   - 患者存在但没有授权、指定接收方未获该患者授权，都是成功返回空清单；
+//   - 清单里有授权不代表接收方此刻能读取（未开始的授权仍读取被拒）；
+//   - 两种失败：内部使用者查询不存在的患者得到 ErrNotFound；接收方即使持有
+//     有效授权也不能调用这个内部查询，得到 ErrAccessDenied 且无授权资料；
+//   - 患者停用后内部使用者仍能列出历史授权，接收方读取则被拒绝。
+//
+// 全程只使用合成患者资料。运行：
+//
+//	go run ./examples/list_authorizations
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/bengzyyys/clinical-exchange/clinical"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "clinical-list-auth-")
+	must("创建临时数据目录", err)
+	defer os.RemoveAll(dir)
+
+	store, err := clinical.Open(dir)
+	must("打开本地存储", err)
+	defer store.Close()
+
+	doctor := clinical.InternalActor("doctor-1")
+	insurer1 := clinical.ReceiverActor("insurer-1")
+	insurer2 := clinical.ReceiverActor("insurer-2")
+	insurer3 := clinical.ReceiverActor("insurer-3")
+
+	now := time.Now()
+
+	// ---- 准备合成患者、一次就诊与已生效记录 ----
+	patient, err := store.RegisterPatient(doctor, "合成患者戊")
+	must("登记合成患者戊", err)
+	encounter, err := store.AddEncounter(doctor, patient.ID, now)
+	must("登记就诊", err)
+
+	diag1, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, "合成诊断一：高血压 I10")
+	must("创建第一条诊断草稿", err)
+	_, err = store.ActivateRecord(doctor, diag1.ID)
+	must("生效第一条诊断", err)
+
+	diag2, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Diagnosis, "合成诊断二：2 型糖尿病 E11")
+	must("创建第二条诊断草稿", err)
+	_, err = store.ActivateRecord(doctor, diag2.ID)
+	must("生效第二条诊断", err)
+
+	order1, err := store.CreateDraft(doctor, patient.ID, encounter.ID,
+		clinical.Order, "合成医嘱一：空腹血糖检测")
+	must("创建医嘱草稿", err)
+	_, err = store.ActivateRecord(doctor, order1.ID)
+	must("生效医嘱", err)
+
+	// ---- 同一患者向两个接收方建立 4 条授权，覆盖四种生命周期状态 ----
+
+	// 授权一：insurer-1，整类范围（该就诊全部诊断），时间窗覆盖 now，当前有效。
+	grantActive, err := store.Grant(doctor, patient.ID, insurer1.ID,
+		[]clinical.Scope{{EncounterID: encounter.ID, Category: clinical.Diagnosis}},
+		now.Add(-time.Hour), now.Add(24*time.Hour))
+	must("建立授权一（当前有效·整类诊断）", err)
+
+	// 授权二：insurer-2，限定记录范围（只选第二条诊断），时间窗尚未开始。
+	grantFuture, err := store.GrantSelective(doctor, patient.ID, insurer2.ID, nil,
+		[]clinical.RecordSelection{{
+			EncounterID: encounter.ID,
+			Category:    clinical.Diagnosis,
+			RecordID:    diag2.ID,
+		}},
+		now.Add(24*time.Hour), now.Add(48*time.Hour))
+	must("建立授权二（尚未开始·限定诊断）", err)
+
+	// 授权三：insurer-2，整类范围（该就诊全部医嘱），时间窗已经到期。
+	grantExpired, err := store.Grant(doctor, patient.ID, insurer2.ID,
+		[]clinical.Scope{{EncounterID: encounter.ID, Category: clinical.Order}},
+		now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+	must("建立授权三（已到期·整类医嘱）", err)
+
+	// 授权四：insurer-1，限定记录范围（只选第一条诊断），时间窗覆盖 now，
+	// 建立后由内部使用者撤回——撤回后它仍应出现在清单里。
+	grantRevoked, err := store.GrantSelective(doctor, patient.ID, insurer1.ID, nil,
+		[]clinical.RecordSelection{{
+			EncounterID: encounter.ID,
+			Category:    clinical.Diagnosis,
+			RecordID:    diag1.ID,
+		}},
+		now.Add(-time.Hour), now.Add(24*time.Hour))
+	must("建立授权四（撤回前·限定诊断）", err)
+	must("撤回授权四", store.Revoke(doctor, patient.ID, grantRevoked.ID))
+
+	labels := map[clinical.ID]string{
+		grantActive.ID:  "授权一（当前有效·整类诊断）",
+		grantFuture.ID:  "授权二（尚未开始·限定诊断）",
+		grantExpired.ID: "授权三（已到期·整类医嘱）",
+		grantRevoked.ID: "授权四（已撤回·限定诊断）",
+	}
+	fmt.Println("准备完成: 1 名合成患者、1 次就诊、2 条已生效诊断与 1 条已生效医嘱；" +
+		"建立 4 条授权（当前有效、尚未开始、已到期、已撤回各 1 条）")
+
+	// ---- 查询一：只按患者查询，接收方参数为空字符串，列出授予所有接收方的授权 ----
+	allRows := printListing(store, doctor, patient.ID, "", labels, now,
+		"查询一：只按患者查询")
+
+	// ---- 查询二/三：再指定接收方，只保留授予该接收方的条目 ----
+	rowsInsurer1 := printListing(store, doctor, patient.ID, insurer1.ID, labels, now,
+		"查询二：再指定接收方")
+	rowsInsurer2 := printListing(store, doctor, patient.ID, insurer2.ID, labels, now,
+		"查询三：再指定接收方")
+
+	// 核对：条数、患者归属、撤回授权在“全部”与“insurer-1”两张清单中都出现。
+	belongsToPatient := func(rows []clinical.Authorization) bool {
+		for _, a := range rows {
+			if a.PatientID != patient.ID {
+				return false
+			}
+		}
+		return true
+	}
+	listHas := func(rows []clinical.Authorization, id clinical.ID) bool {
+		for _, a := range rows {
+			if a.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	shapeOK := len(allRows) == 4 && len(rowsInsurer1) == 2 && len(rowsInsurer2) == 2 &&
+		belongsToPatient(allRows) && belongsToPatient(rowsInsurer1) && belongsToPatient(rowsInsurer2) &&
+		listHas(allRows, grantRevoked.ID) && listHas(rowsInsurer1, grantRevoked.ID)
+	fmt.Printf("清单核对: 不指定接收方 %d 条、insurer-1 %d 条、insurer-2 %d 条；"+
+		"各行归属均为患者本人=%v；撤回授权在“全部”与“insurer-1”两张清单中都出现=%v\n",
+		len(allRows), len(rowsInsurer1), len(rowsInsurer2),
+		shapeOK && idsAscending(allRows), listHas(allRows, grantRevoked.ID) && listHas(rowsInsurer1, grantRevoked.ID))
+
+	// ---- 清单里有授权，不等于接收方此刻能读取临床内容 ----
+	// insurer-2 名下有 2 条授权（未开始的限定诊断、已到期的整类医嘱），
+	// 但此刻读取诊断仍被拒绝：是否能读要在实际读取时按授权状态重新判断。
+	if _, err := store.Read(insurer2, patient.ID, encounter.ID, clinical.Diagnosis); !errors.Is(err, clinical.ErrAccessDenied) {
+		die("未开始授权不应允许读取，实际得到 %v", err)
+	}
+	fmt.Printf("对照读取: insurer-2 清单里有 %d 条授权，但此刻读取诊断仍被拒绝（%v）"+
+		"——列出授权不等于此刻能读取临床内容\n", len(rowsInsurer2), clinical.ErrAccessDenied)
+
+	// ---- 另一名患者也授权给同一个接收方，其条目不混入本患者清单 ----
+	patient2, err := store.RegisterPatient(doctor, "合成患者己")
+	must("登记合成患者己", err)
+	encounter2, err := store.AddEncounter(doctor, patient2.ID, now)
+	must("登记患者己的就诊", err)
+	otherDraft, err := store.CreateDraft(doctor, patient2.ID, encounter2.ID,
+		clinical.Diagnosis, "合成诊断：患者己的感冒 J00")
+	must("创建患者己的诊断草稿", err)
+	_, err = store.ActivateRecord(doctor, otherDraft.ID)
+	must("生效患者己的诊断", err)
+	grant2, err := store.Grant(doctor, patient2.ID, insurer1.ID,
+		[]clinical.Scope{{EncounterID: encounter2.ID, Category: clinical.Diagnosis}},
+		now.Add(-time.Hour), now.Add(24*time.Hour))
+	must("为患者己建立授权", err)
+
+	rowsB, err := store.ListAuthorizations(doctor, patient2.ID, insurer1.ID)
+	must("查询患者己的清单", err)
+	rowsInsurer1Again, err := store.ListAuthorizations(doctor, patient.ID, insurer1.ID)
+	must("再次查询患者戊/insurer-1 的清单", err)
+	noLeakAcrossPatients := len(rowsB) == 1 && rowsB[0].ID == grant2.ID &&
+		rowsB[0].PatientID == patient2.ID &&
+		len(rowsInsurer1Again) == 2 && sameIDSet(rowsInsurer1Again, rowsInsurer1)
+	fmt.Printf("同一接收方跨患者不混入: 患者己/insurer-1 清单只有患者己自己的 1 条授权=%v；"+
+		"再查患者戊/insurer-1 仍为此前 %d 条=%v\n",
+		len(rowsB) == 1 && rowsB[0].ID == grant2.ID, len(rowsInsurer1),
+		len(rowsInsurer1Again) == 2 && sameIDSet(rowsInsurer1Again, rowsInsurer1) && noLeakAcrossPatients)
+
+	// ---- 成功的空清单：患者存在但没有授权 / 指定接收方未获该患者授权 ----
+	patient3, err := store.RegisterPatient(doctor, "合成患者庚")
+	must("登记从无授权的合成患者庚", err)
+	emptyNoGrant, err := store.ListAuthorizations(doctor, patient3.ID, "")
+	must("查询从无授权的患者", err)
+	emptyStranger, err := store.ListAuthorizations(doctor, patient.ID, insurer3.ID)
+	must("查询未获该患者授权的接收方", err)
+	fmt.Printf("成功的空清单: 从无授权的患者=%d 条、患者戊搭配未获其授权的接收方 insurer-3=%d 条"+
+		"（两次都成功返回，不是患者不存在，也不是被拒绝）\n",
+		len(emptyNoGrant), len(emptyStranger))
+
+	// ---- 失败一：内部使用者查询不存在的患者 ----
+	missingRows, missingErr := store.ListAuthorizations(doctor, "pat_does_not_exist", "")
+	if !errors.Is(missingErr, clinical.ErrNotFound) || len(missingRows) != 0 {
+		die("查询不存在患者应返回 0 条与 ErrNotFound，实际得到 %d 条、%v",
+			len(missingRows), missingErr)
+	}
+	fmt.Printf("失败一（内部使用者查询不存在的患者）: %v，返回条数=%d（ErrNotFound）\n",
+		missingErr, len(missingRows))
+
+	// ---- 失败二：接收方即使持有有效授权，也不能调用这个内部查询 ----
+	deniedRows, deniedErr := store.ListAuthorizations(insurer1, patient.ID, "")
+	deniedSelfRows, deniedSelfErr := store.ListAuthorizations(insurer1, patient.ID, insurer1.ID)
+	if !errors.Is(deniedErr, clinical.ErrAccessDenied) || len(deniedRows) != 0 ||
+		!errors.Is(deniedSelfErr, clinical.ErrAccessDenied) || len(deniedSelfRows) != 0 {
+		die("接收方调用内部查询应返回 0 条与 ErrAccessDenied，实际得到 %d 条/%v 与 %d 条/%v",
+			len(deniedRows), deniedErr, len(deniedSelfRows), deniedSelfErr)
+	}
+	fmt.Printf("失败二（持有有效授权的接收方调用内部查询）: 不指定接收方与只过滤自己都被拒绝"+
+		"（%v），返回条数=%d/%d（ErrAccessDenied，不提供任何授权资料）\n",
+		clinical.ErrAccessDenied, len(deniedRows), len(deniedSelfRows))
+
+	// ---- 患者停用后：内部清单仍是完整历史，接收方读取则被拒绝 ----
+	must("停用患者戊", store.DeactivatePatient(doctor, patient.ID))
+	afterDeactivate, err := store.ListAuthorizations(doctor, patient.ID, insurer1.ID)
+	must("停用后内部使用者查询清单", err)
+	storedRevoked, err := store.GetAuthorization(doctor, patient.ID, grantRevoked.ID)
+	must("停用后取回已撤回授权", err)
+	listedRevoked := findAuthorization(afterDeactivate, grantRevoked.ID)
+	revokedPreserved := listedRevoked != nil && listedRevoked.RevokedAt != nil &&
+		listedRevoked.RevokedAt.Equal(*storedRevoked.RevokedAt)
+	fmt.Printf("患者停用后: 内部清单仍成功（insurer-1 条数=%d），已撤回授权仍带原撤回时间出现=%v\n",
+		len(afterDeactivate), revokedPreserved)
+
+	if _, err := store.Read(insurer1, patient.ID, encounter.ID, clinical.Diagnosis); !errors.Is(err, clinical.ErrAccessDenied) {
+		die("患者停用后接收方读取应被拒绝，实际得到 %v", err)
+	}
+	fmt.Printf("患者停用后: 接收方读取被拒绝（%v）——清单不能替代实际读取时的权限检查\n",
+		clinical.ErrAccessDenied)
+}
+
+// printListing 执行一次清单查询并打印结果。清单本身按授权标识升序返回；
+// 展示时为了输出稳定可读，改按（接收方、生命周期、说明标签）重排，并单独
+// 报告“按授权标识升序”的核对结果。
+func printListing(store *clinical.Store, actor clinical.Actor, patientID clinical.ID,
+	receiverArg string, labels map[clinical.ID]string, now time.Time, title string,
+) []clinical.Authorization {
+	rows, err := store.ListAuthorizations(actor, patientID, receiverArg)
+	must(title, err)
+	fmt.Printf("%s（接收方参数=%q）: 条数=%d，错误=%v，按授权标识升序=%v\n",
+		title, receiverArg, len(rows), err, idsAscending(rows))
+	for _, a := range rowsSortedForDisplay(rows, labels, now) {
+		printAuthorizationRow(a, labels[a.ID], now)
+	}
+	return rows
+}
+
+func printAuthorizationRow(a clinical.Authorization, label string, now time.Time) {
+	// 时间窗状态只描述授权自身的 [StartsAt, ExpiresAt)，不考虑撤回；
+	// 撤回状态与 ActiveAt 单独展示。
+	windowState := "在时间窗内"
+	switch {
+	case now.Before(a.StartsAt):
+		windowState = "尚未开始"
+	case !now.Before(a.ExpiresAt):
+		windowState = "已到期"
+	}
+	revoked := "false"
+	if a.RevokedAt != nil {
+		revoked = fmt.Sprintf("true（撤回时间已保留=%v）", !a.RevokedAt.IsZero())
+	}
+	fmt.Printf("  - %s：接收方=%s，整类范围 %d 项（%s），限定记录 %d 条（%s）；"+
+		"时间窗状态=%s；已撤回=%s；ActiveAt(now)=%v\n",
+		label, a.ReceiverID,
+		len(a.Scopes), categoryList(scopeCategories(a.Scopes)...),
+		len(a.Selections), categoryList(selectionCategories(a.Selections)...),
+		windowState, revoked, a.ActiveAt(now))
+}
+
+// rowsSortedForDisplay 返回按展示键排序的副本，不改动查询返回的顺序。
+func rowsSortedForDisplay(rows []clinical.Authorization, labels map[clinical.ID]string, now time.Time) []clinical.Authorization {
+	out := append([]clinical.Authorization(nil), rows...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := displayRank(out[i], now), displayRank(out[j], now)
+		if out[i].ReceiverID != out[j].ReceiverID {
+			return out[i].ReceiverID < out[j].ReceiverID
+		}
+		if ri != rj {
+			return ri < rj
+		}
+		return labels[out[i].ID] < labels[out[j].ID]
+	})
+	return out
+}
+
+// displayRank 仅用于展示排序：当前有效 0、尚未开始 1、已到期 2、已撤回 3。
+func displayRank(a clinical.Authorization, now time.Time) int {
+	if a.RevokedAt != nil {
+		return 3
+	}
+	switch {
+	case now.Before(a.StartsAt):
+		return 1
+	case !now.Before(a.ExpiresAt):
+		return 2
+	default:
+		return 0
+	}
+}
+
+func idsAscending(rows []clinical.Authorization) bool {
+	for i := 1; i < len(rows); i++ {
+		if rows[i-1].ID >= rows[i].ID {
+			return false
+		}
+	}
+	return true
+}
+
+func sameIDSet(a, b []clinical.Authorization) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[clinical.ID]bool{}
+	for _, x := range a {
+		seen[x.ID] = true
+	}
+	for _, x := range b {
+		if !seen[x.ID] {
+			return false
+		}
+	}
+	return true
+}
+
+func findAuthorization(rows []clinical.Authorization, id clinical.ID) *clinical.Authorization {
+	for i := range rows {
+		if rows[i].ID == id {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+func scopeCategories(sc []clinical.Scope) []string {
+	cats := make([]string, 0, len(sc))
+	for _, s := range sc {
+		cats = append(cats, s.Category)
+	}
+	return cats
+}
+
+func selectionCategories(sel []clinical.RecordSelection) []string {
+	cats := make([]string, 0, len(sel))
+	for _, s := range sel {
+		cats = append(cats, s.Category)
+	}
+	return cats
+}
+
+// categoryList 把类别汇总成稳定的“diagnosis×1、order×2”样式；空列表显示“无”。
+func categoryList(cats ...string) string {
+	count := map[string]int{}
+	for _, c := range cats {
+		count[c]++
+	}
+	var parts []string
+	for _, c := range []string{clinical.Diagnosis, clinical.Order} {
+		if count[c] > 0 {
+			parts = append(parts, fmt.Sprintf("%s×%d", c, count[c]))
+		}
+	}
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, "、")
+}
+
+func must(step string, err error) {
+	if err != nil {
+		die("%s失败: %v", step, err)
+	}
+}
+
+func die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "example: "+format+"\n", args...)
+	os.Exit(1)
+}
+```
+
+结果说明（对照输出；授权标识由存储随机生成，输出用建立时的说明标签指代，
+因此每次运行文本一致）：
+
+```text
+准备完成: 1 名合成患者、1 次就诊、2 条已生效诊断与 1 条已生效医嘱；建立 4 条授权（当前有效、尚未开始、已到期、已撤回各 1 条）
+查询一：只按患者查询（接收方参数=""）: 条数=4，错误=<nil>，按授权标识升序=true
+  - 授权一（当前有效·整类诊断）：接收方=insurer-1，整类范围 1 项（diagnosis×1），限定记录 0 条（无）；时间窗状态=在时间窗内；已撤回=false；ActiveAt(now)=true
+  - 授权四（已撤回·限定诊断）：接收方=insurer-1，整类范围 0 项（无），限定记录 1 条（diagnosis×1）；时间窗状态=在时间窗内；已撤回=true（撤回时间已保留=true）；ActiveAt(now)=false
+  - 授权二（尚未开始·限定诊断）：接收方=insurer-2，整类范围 0 项（无），限定记录 1 条（diagnosis×1）；时间窗状态=尚未开始；已撤回=false；ActiveAt(now)=false
+  - 授权三（已到期·整类医嘱）：接收方=insurer-2，整类范围 1 项（order×1），限定记录 0 条（无）；时间窗状态=已到期；已撤回=false；ActiveAt(now)=false
+查询二：再指定接收方（接收方参数="insurer-1"）: 条数=2，错误=<nil>，按授权标识升序=true
+  - 授权一（当前有效·整类诊断）：接收方=insurer-1，整类范围 1 项（diagnosis×1），限定记录 0 条（无）；时间窗状态=在时间窗内；已撤回=false；ActiveAt(now)=true
+  - 授权四（已撤回·限定诊断）：接收方=insurer-1，整类范围 0 项（无），限定记录 1 条（diagnosis×1）；时间窗状态=在时间窗内；已撤回=true（撤回时间已保留=true）；ActiveAt(now)=false
+查询三：再指定接收方（接收方参数="insurer-2"）: 条数=2，错误=<nil>，按授权标识升序=true
+  - 授权二（尚未开始·限定诊断）：接收方=insurer-2，整类范围 0 项（无），限定记录 1 条（diagnosis×1）；时间窗状态=尚未开始；已撤回=false；ActiveAt(now)=false
+  - 授权三（已到期·整类医嘱）：接收方=insurer-2，整类范围 1 项（order×1），限定记录 0 条（无）；时间窗状态=已到期；已撤回=false；ActiveAt(now)=false
+清单核对: 不指定接收方 4 条、insurer-1 2 条、insurer-2 2 条；各行归属均为患者本人=true；撤回授权在“全部”与“insurer-1”两张清单中都出现=true
+对照读取: insurer-2 清单里有 2 条授权，但此刻读取诊断仍被拒绝（clinical: access denied）——列出授权不等于此刻能读取临床内容
+同一接收方跨患者不混入: 患者己/insurer-1 清单只有患者己自己的 1 条授权=true；再查患者戊/insurer-1 仍为此前 2 条=true
+成功的空清单: 从无授权的患者=0 条、患者戊搭配未获其授权的接收方 insurer-3=0 条（两次都成功返回，不是患者不存在，也不是被拒绝）
+失败一（内部使用者查询不存在的患者）: clinical: referenced object not found: patient "pat_does_not_exist"，返回条数=0（ErrNotFound）
+失败二（持有有效授权的接收方调用内部查询）: 不指定接收方与只过滤自己都被拒绝（clinical: access denied），返回条数=0/0（ErrAccessDenied，不提供任何授权资料）
+患者停用后: 内部清单仍成功（insurer-1 条数=2），已撤回授权仍带原撤回时间出现=true
+患者停用后: 接收方读取被拒绝（clinical: access denied）——清单不能替代实际读取时的权限检查
+```
+
+- **两张清单的差异**：不指定接收方时，患者授予 insurer-1 与 insurer-2 的
+  4 条授权全部返回；指定 `insurer-1` 只剩其名下 2 条，指定 `insurer-2` 只剩
+  其名下 2 条。每张清单都核对为按授权标识升序（示例展示时另按接收方与状态
+  重排，仅为输出易读）。
+- **四种状态都在、范围形态各自保留**：授权一在时间窗内未撤回，
+  `ActiveAt(now)=true`；授权二尚未开始、授权三已到期、授权四已撤回，
+  `ActiveAt(now)` 均为 `false`。整类授权显示为“整类范围 1 项、限定记录
+  0 条”，限定授权相反；授权四撤回后仍出现在“全部”和“insurer-1”两张清单中，
+  并带有已保存的撤回时间。
+- **列出不等于能读**：insurer-2 清单里有 2 条授权，但其中一条尚未开始、
+  一条已到期，此刻读取诊断仍得到 `ErrAccessDenied`。
+- **跨患者不混入**：患者己也向 insurer-1 授权后，查患者己只看到自己的 1 条；
+  回头再查患者戊/insurer-1 仍是原来的 2 条，同一接收方不会把两名患者的条目
+  带到一起。
+- **成功的空清单**：从无授权的患者、患者搭配未获其授权的接收方，都成功返回
+  0 条；只有内部使用者查不存在的患者才是 `ErrNotFound`。
+- **接收方被拒绝**：insurer-1 持有患者当前有效的整类授权，但无论是否按自己
+  过滤，调用 `ListAuthorizations` 都得到 `ErrAccessDenied` 且 0 条结果，不
+  提供任何授权资料。
+- **停用后**：内部使用者列出的历史授权不缺不损（撤回时间与保存值一致），而
+  接收方读取同一范围被拒绝——清单只是历史视图，读取权限以实际读取时的检查
+  为准。
+
+本次只补齐 `ListAuthorizations` 的使用说明与示例：授权建立、撤回、接收方
+读取、交换与回执等已有公开行为与示例均保持不变。
 
 ## 取包被拒后仍可登记回执
 
@@ -1081,7 +1573,7 @@ func die(format string, args ...any) {
 
 | 身份 | 能力 |
 | --- | --- |
-| 内部使用者 `InternalActor` | 登记、草稿/生效/更正、授权与撤回、查看全部草稿、完整历史与审计 |
+| 内部使用者 `InternalActor` | 登记、草稿/生效/更正、授权与撤回、按患者查看授权清单、查看全部草稿、完整历史与审计 |
 | 接收方 `ReceiverActor` | 仅在有效授权范围内读取当前生效版本 |
 
 `clinical.Ready()` 保持基线行为，始终返回 `true`。
