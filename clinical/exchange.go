@@ -93,12 +93,7 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 			if !sameExchangeRequest(existing, patientID, receiverID, authorizationID, wanted) {
 				return fmt.Errorf("%w: request id %q already used with different parameters", ErrConflict, requestID)
 			}
-			result = *existing
-			if existing.Receipt != nil {
-				r := *existing.Receipt
-				result.Receipt = &r
-			}
-			result.Package.Records = append([]PackagedRecord(nil), existing.Package.Records...)
+			result = cloneExchangeValue(existing)
 			// 命中已保存的交换：没有任何状态变更，不落盘——即使本地保存
 			// 条件当前不可用，重试也必须成功返回原交换。
 			return errUnchanged
@@ -184,8 +179,7 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 		}
 		snap.Exchanges[x.ID] = x
 		s.addAudit(snap, patientID, actor, ActionExchanged, "exchange", x.ID, now)
-		result = *x
-		result.Package.Records = append([]PackagedRecord(nil), x.Package.Records...)
+		result = cloneExchangeValue(x)
 		return nil
 	})
 	return result, err
@@ -433,11 +427,17 @@ func uniqueSortedIDs(ids []ID) []ID {
 	return out
 }
 
+// clonePackage 返回包的独立副本：记录集合整体复制，调用方对副本的修改
+// （改记录、增删或重排记录集合）不影响原包。
 func clonePackage(p Package) Package {
 	p.Records = append([]PackagedRecord(nil), p.Records...)
 	return p
 }
 
+// cloneExchangeValue 是交换对象的统一副本规则：包内容经 clonePackage 复制，
+// 回执单独复制一份；尚未登记回执时结果仍为 nil，不补空回执。所有向调用方
+// 返回交换的入口（创建、幂等重试、单个查看、清单）以及状态深拷贝都经由此
+// 处，保证各份结果彼此独立、也独立于库内保存的交换。
 func cloneExchangeValue(x *Exchange) Exchange {
 	y := *x
 	y.Package = clonePackage(x.Package)

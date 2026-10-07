@@ -269,12 +269,8 @@ func cloneSnapshot(in *snapshot) *snapshot {
 		out.Authorizations[k] = &a
 	}
 	for k, x := range in.Exchanges {
-		y := *x
-		y.Package.Records = append([]PackagedRecord(nil), x.Package.Records...)
-		if x.Receipt != nil {
-			r := *x.Receipt
-			y.Receipt = &r
-		}
+		// 与对外返回共用同一套交换副本规则（exchange.go 的 cloneExchangeValue）。
+		y := cloneExchangeValue(x)
 		out.Exchanges[k] = &y
 	}
 	for _, ev := range in.AuditEvents {
