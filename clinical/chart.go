@@ -43,17 +43,9 @@ func (s *Store) Chart(actor Actor, patientID ID) (PatientChart, error) {
 		}
 		sortEncounters(chart.Encounters)
 
-		var recs []*Record
-		for _, r := range snap.Records {
-			if r.PatientID == patientID {
-				recs = append(recs, r)
-			}
-		}
-		sort.Slice(recs, func(i, j int) bool { return recs[i].ID < recs[j].ID })
-
-		for _, r := range recs {
-			chart.Records = append(chart.Records, buildHistory(snap, r))
-		}
+		chart.Records = recordHistories(snap, func(r *Record) bool {
+			return r.PatientID == patientID
+		})
 
 		chart.AuditEvents = auditEventsFor(snap, patientID)
 		return nil
@@ -107,19 +99,32 @@ func (s *Store) EncounterRecords(actor Actor, patientID, encounterID ID) ([]Reco
 		if _, err := requireEncounter(snap, patientID, encounterID); err != nil {
 			return err
 		}
-		var recs []*Record
-		for _, r := range snap.Records {
-			if r.EncounterID == encounterID {
-				recs = append(recs, r)
-			}
-		}
-		sort.Slice(recs, func(i, j int) bool { return recs[i].ID < recs[j].ID })
-		for _, r := range recs {
-			out = append(out, buildHistory(snap, r))
-		}
+		out = recordHistories(snap, func(r *Record) bool {
+			return r.EncounterID == encounterID
+		})
 		return nil
 	})
 	return out, err
+}
+
+// recordHistories 是 Chart 与 EncounterRecords 共用的记录列表整理规则：
+// 按 match 收集记录，按记录标识的字符串顺序升序排列（不是录入时间顺序），
+// 再逐条生成完整历史视图。两个入口只在筛选条件上不同——完整档案按患者、
+// 单次就诊查询按就诊——因此同一就诊的记录在两种入口下内容、顺序与历史
+// 必然一致。没有匹配记录时返回 nil，保留原有的空结果表示。
+func recordHistories(snap *snapshot, match func(*Record) bool) []RecordHistory {
+	var recs []*Record
+	for _, r := range snap.Records {
+		if match(r) {
+			recs = append(recs, r)
+		}
+	}
+	sort.Slice(recs, func(i, j int) bool { return recs[i].ID < recs[j].ID })
+	var out []RecordHistory
+	for _, r := range recs {
+		out = append(out, buildHistory(snap, r))
+	}
+	return out
 }
 
 func buildHistory(snap *snapshot, r *Record) RecordHistory {
