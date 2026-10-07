@@ -146,9 +146,17 @@ func (s *Store) ActivateRecord(actor Actor, recordID ID) (Version, error) {
 
 // CorrectRecord 对当前生效版本进行更正，生成同一条记录的新版本。
 //
-// reason 必须非空；expectedCurrentVersion 必须等于记录当前版本号，
-// 否则返回 ErrConflict 且状态保持不变。旧版本内容、版本关系（PrevID）
-// 与更正原因都会保留。新版本与审计事件一同原子落盘。
+// content 必须非空且是完整合法的 UTF-8；reason 必须非空白且同样必须是完整
+// 合法的 UTF-8，否则返回 ErrInvalidArgument 且状态保持不变。更正原因会原样
+// 落盘并作为解释病历变化的正式历史长期保留：本地快照以 JSON 持久化，
+// encoding/json 会把无效 UTF-8 字节静默替换为 U+FFFD，若放行坏字节原因，
+// 当次看到的是原字节而关闭重开后原因已被改写成另一段文字。因此坏字节位于
+// 开头、中间、结尾，或最后一个多字节字符没有写完整，都整体拒绝，绝不靠
+// 替换、截断或跳过坏字节继续保存，也不能只保存其中可读的合法部分；用户
+// 明确输入的合法 U+FFFD 字符本身是合法 UTF-8，不受此限制。
+// expectedCurrentVersion 必须等于记录当前版本号，否则返回 ErrConflict 且
+// 状态保持不变。旧版本内容、版本关系（PrevID）与更正原因都会保留。
+// 新版本与审计事件一同原子落盘。
 func (s *Store) CorrectRecord(actor Actor, recordID ID, expectedCurrentVersion int, content, reason string) (Version, error) {
 	if !actor.valid() || !actor.IsInternal() {
 		return Version{}, ErrAccessDenied
@@ -161,6 +169,13 @@ func (s *Store) CorrectRecord(actor Actor, recordID ID, expectedCurrentVersion i
 	}
 	if strings.TrimSpace(reason) == "" {
 		return Version{}, fmt.Errorf("%w: correction reason is required", ErrInvalidArgument)
+	}
+	// 更正原因随版本原样落盘，必须是完整合法的 UTF-8：坏字节位于开头、中间、
+	// 结尾，或最后一个多字节字符没有写完整，都在此拒绝，不能让 JSON 落盘把
+	// 原因替换成 U+FFFD，导致重开后同一版本的原因与提交时不同。校验先于
+	// 快照内的患者停用与版本号判定，坏字节不会因业务状态被换一种错误放过。
+	if !utf8.ValidString(reason) {
+		return Version{}, fmt.Errorf("%w: correction reason must be valid UTF-8", ErrInvalidArgument)
 	}
 	if expectedCurrentVersion <= 0 {
 		return Version{}, fmt.Errorf("%w: expected current version must be positive", ErrInvalidArgument)
