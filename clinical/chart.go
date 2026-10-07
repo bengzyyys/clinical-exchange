@@ -55,25 +55,44 @@ func (s *Store) Chart(actor Actor, patientID ID) (PatientChart, error) {
 			chart.Records = append(chart.Records, buildHistory(snap, r))
 		}
 
-		for _, ev := range snap.AuditEvents {
-			if ev.PatientID == patientID {
-				// 审计事件按追加顺序保存，即真实发生顺序；
-				// 时间戳相同（如注入时钟）时也不能打乱。
-				chart.AuditEvents = append(chart.AuditEvents, *ev)
-			}
-		}
+		chart.AuditEvents = auditEventsFor(snap, patientID)
 		return nil
 	})
 	return chart, err
 }
 
 // AuditEvents 仅供内部使用者按患者查看审计事件，按发生时间旧到新。
+// 独立查询审计历史，不连带整理就诊与记录版本；选取规则与 Chart 中的
+// 审计列表一致（同一份正式历史，两个入口逐项对应）。
 func (s *Store) AuditEvents(actor Actor, patientID ID) ([]AuditEvent, error) {
-	chart, err := s.Chart(actor, patientID)
+	if !actor.valid() || !actor.IsInternal() {
+		return nil, ErrAccessDenied
+	}
+	var events []AuditEvent
+	err := s.view(func(snap *snapshot) error {
+		if _, err := requirePatient(snap, patientID); err != nil {
+			return err
+		}
+		events = auditEventsFor(snap, patientID)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return chart.AuditEvents, nil
+	return events, nil
+}
+
+// auditEventsFor 取出指定患者的全部审计事件。审计事件按追加顺序保存，
+// 即真实发生顺序；时间戳相同（如注入时钟）时也不能打乱。返回的是
+// 逐事件拷贝的独立列表，调用方改动不会写回正式历史。
+func auditEventsFor(snap *snapshot, patientID ID) []AuditEvent {
+	var events []AuditEvent
+	for _, ev := range snap.AuditEvents {
+		if ev.PatientID == patientID {
+			events = append(events, *ev)
+		}
+	}
+	return events
 }
 
 // EncounterRecords 仅供内部使用者查看某次就诊下的记录及完整历史。
