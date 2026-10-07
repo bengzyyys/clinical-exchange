@@ -268,13 +268,10 @@ func cloneSnapshot(in *snapshot) *snapshot {
 		}
 		out.Authorizations[k] = &a
 	}
+	// 交换的包内记录集合与回执复制规则与各查询出口完全一致，统一由
+	// cloneExchangeValue 实现，避免变更路径与查询路径各写一份拷贝逻辑。
 	for k, x := range in.Exchanges {
-		y := *x
-		y.Package.Records = append([]PackagedRecord(nil), x.Package.Records...)
-		if x.Receipt != nil {
-			r := *x.Receipt
-			y.Receipt = &r
-		}
+		y := cloneExchangeValue(x)
 		out.Exchanges[k] = &y
 	}
 	for _, ev := range in.AuditEvents {

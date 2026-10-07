@@ -93,12 +93,9 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 			if !sameExchangeRequest(existing, patientID, receiverID, authorizationID, wanted) {
 				return fmt.Errorf("%w: request id %q already used with different parameters", ErrConflict, requestID)
 			}
-			result = *existing
-			if existing.Receipt != nil {
-				r := *existing.Receipt
-				result.Receipt = &r
-			}
-			result.Package.Records = append([]PackagedRecord(nil), existing.Package.Records...)
+			// 所有出口共用同一复制规则（cloneExchangeValue）：包内记录与
+			// 回执都取独立副本；尚未登记回执时保持 nil，不补空回执。
+			result = cloneExchangeValue(existing)
 			// 命中已保存的交换：没有任何状态变更，不落盘——即使本地保存
 			// 条件当前不可用，重试也必须成功返回原交换。
 			return errUnchanged
@@ -184,8 +181,7 @@ func (s *Store) CreateExchange(actor Actor, patientID ID, receiverID, authorizat
 		}
 		snap.Exchanges[x.ID] = x
 		s.addAudit(snap, patientID, actor, ActionExchanged, "exchange", x.ID, now)
-		result = *x
-		result.Package.Records = append([]PackagedRecord(nil), x.Package.Records...)
+		result = cloneExchangeValue(x)
 		return nil
 	})
 	return result, err
@@ -433,18 +429,32 @@ func uniqueSortedIDs(ids []ID) []ID {
 	return out
 }
 
+// clonePackage 返回包的独立副本：包头按值复制，包内记录集合复制成一份新的
+// 底层数组，使调用方对返回记录的正文、版本标识或集合本身的增删重排都只影响
+// 这份副本，不波及库内正式包或另一份已取得的结果。
 func clonePackage(p Package) Package {
 	p.Records = append([]PackagedRecord(nil), p.Records...)
 	return p
 }
 
+// cloneReceipt 返回回执的独立副本。调用方对结果中回执的结果、原因或首次登记
+// 时间的修改只影响这份副本；各份结果之间不共享可被改写的回执指针。
+func cloneReceipt(r *Receipt) *Receipt {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	return &cp
+}
+
+// cloneExchangeValue 是交换副本规则的唯一实现：包内记录集合与回执都取独立
+// 副本，其余按值复制。交换尚未登记回执时 Receipt 保持 nil——不补出空回执。
+// 创建交换、幂等重试、单个查询、交换清单以及变更前的快照深拷贝都经由这里，
+// 因此调整副本规则只需改这一处。
 func cloneExchangeValue(x *Exchange) Exchange {
 	y := *x
 	y.Package = clonePackage(x.Package)
-	if x.Receipt != nil {
-		r := *x.Receipt
-		y.Receipt = &r
-	}
+	y.Receipt = cloneReceipt(x.Receipt)
 	return y
 }
 
